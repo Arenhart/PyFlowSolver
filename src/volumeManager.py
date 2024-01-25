@@ -1,5 +1,7 @@
 import numpy as np
 
+from src.sparseArray import SparseArray
+
 class VolumeManager():
 
     def __init__(self, volume):
@@ -110,11 +112,7 @@ class VolumeManager():
         val_array.resize(vals_n)
         col_idx_array.resize(vals_n)
 
-        sparse_array = {
-            "val": val_array,
-            "col_idx": col_idx_array,
-            "row_ptr": row_ptr_array,
-        }
+        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
 
         return sparse_array, condensed_b
     
@@ -186,13 +184,7 @@ class VolumeManager():
         val_array.resize(vals_n)
         col_idx_array.resize(vals_n)
 
-        sparse_array = {
-        "val": val_array,
-        "col_idx": col_idx_array,
-        "row_ptr": row_ptr_array,
-        }
-
-        self._sort_sparse_array(sparse_array)
+        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
 
         return sparse_array, condensed_b
 
@@ -203,18 +195,4 @@ class VolumeManager():
         output = i - self.nulls_count[i]
 
         return output
-    
-    def _sort_sparse_array(self, sparse_array):
-        for start, stop in self.row_indexes_iterator(sparse_array):
-            val = sparse_array["val"][start:stop]
-            col_idx = sparse_array["col_idx"][start:stop]
-            col_idx, val = zip(*sorted(zip(col_idx, val)))
-            sparse_array["val"][start:stop] = val
-            sparse_array["col_idx"][start:stop] = col_idx
 
-
-    def row_indexes_iterator(self, sparse_array):
-        for start, stop in zip(sparse_array["row_ptr"][:-1], sparse_array["row_ptr"][1:]):
-            yield start, stop
-        else:
-            yield sparse_array["row_ptr"][-1], sparse_array["val"].size
