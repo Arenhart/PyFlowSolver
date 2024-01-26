@@ -22,6 +22,9 @@ def test_darcy_solver():
     raveled_solution = volume_manager.ravel_sparse_solution(solution)
     np.testing.assert_allclose(raveled_solution, raveled_template, rtol=1e-06)
 
+def test_stokes_solver():
+    pass
+
 
 
 
