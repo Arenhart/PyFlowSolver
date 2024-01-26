@@ -195,4 +195,24 @@ class VolumeManager():
         output = i - self.nulls_count[i]
 
         return output
+    
+    def ravel_dense_solution(self, solution):
+        raveled_solution = np.zeros_like(self.volume)
+        w, h, d = raveled_solution.shape
+        for i, (x, y, z) in enumerate(
+            (a,b,c) for a in range(w) for b in range(h) for c in range(d)
+            ):
+            raveled_solution[x, y, z] = solution[i]
 
+        return raveled_solution
+    
+    def ravel_sparse_solution(self, solution):
+        raveled_solution = np.zeros_like(self.volume)
+        w, h, d = raveled_solution.shape
+        i = 0
+        for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):
+            if self.volume[x, y, z] > np.float32(0):
+                raveled_solution[x, y, z] = solution[i]
+                i += 1
+
+        return raveled_solution

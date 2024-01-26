@@ -29,7 +29,7 @@ class SparseArray():
             yield self.rows - 1, self.row_ptr[-1], self.val.size,
     
     def row_bounds(self, row):
-        if row < (self.rows - 2):
+        if row <= (self.rows - 2):
             start = self.row_ptr[row]
             stop = self.row_ptr[row+1]
         elif row == self.rows - 1:
