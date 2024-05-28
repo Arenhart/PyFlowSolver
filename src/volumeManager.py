@@ -6,8 +6,12 @@ class VolumeManager():
 
     def __init__(self, volume):
         self.volume = volume
-        self.nulls_count = None
+        self._calc_null_counts()
         self._generate_neighbours_dict()
+        self.nonzeros = np.count_nonzero(self.volume)
+        self.len_x = 1
+        self.len_y = 1
+        self.len_z = 1
 
     def _generate_neighbours_dict(self):
         self.neighbours_dict = {}
@@ -117,27 +121,13 @@ class VolumeManager():
         return sparse_array, condensed_b
     
     def get_sparse_system(self):
-        nonzeros = np.count_nonzero(self.volume)
-        self.nulls_count = np.empty(self.volume.size, dtype=int)
-        running_zeros = 0
-        i = 0
         w, h, d = self.volume.shape
-        for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):
-            center_c = self.volume[x, y, z]
-            if center_c > 0:
-                self.nulls_count[i] = running_zeros
-                i += 1
-            else:
-                running_zeros += 1
-                self.nulls_count[i] = running_zeros
-                i += 1
         
-        val_array = np.zeros(nonzeros * 7)
-        col_idx_array = np.zeros(nonzeros * 7, dtype=int)
-        row_ptr_array = np.zeros(nonzeros, dtype=int)
-        condensed_b = np.zeros(nonzeros)
+        val_array = np.zeros(self.nonzeros * 7)
+        col_idx_array = np.zeros(self.nonzeros * 7, dtype=int)
+        row_ptr_array = np.zeros(self.nonzeros, dtype=int)
+        condensed_b = np.zeros(self.nonzeros)
         
-        sparse_i = 0
         vals_n = 0
 
         for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):
@@ -179,7 +169,6 @@ class VolumeManager():
             val_array[vals_n] = -total_c
             col_idx_array[vals_n] = self._unravel(*tuple(coords))
             vals_n += 1
-            i += 1
 
         val_array.resize(vals_n)
         col_idx_array.resize(vals_n)
@@ -195,6 +184,21 @@ class VolumeManager():
         output = i - self.nulls_count[i]
 
         return output
+    
+    def _calc_null_counts(self):
+        self.nulls_count = np.empty(self.volume.size, dtype=int)
+        running_zeros = 0
+        i = 0
+        w, h, d = self.volume.shape
+        for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):
+            center_c = self.volume[x, y, z]
+            if center_c > 0:
+                self.nulls_count[i] = running_zeros
+                i += 1
+            else:
+                running_zeros += 1
+                self.nulls_count[i] = running_zeros
+                i += 1
     
     def ravel_dense_solution(self, solution):
         raveled_solution = np.zeros_like(self.volume)
@@ -216,3 +220,73 @@ class VolumeManager():
                 i += 1
 
         return raveled_solution
+
+    def get_velocity_array(self):
+        velocity_array = np.zeros((self.nonzeros, 3), dtype=np.float32)
+        return velocity_array
+    
+    def get_pressure_array(self):
+        pressure_array = np.zeros(self.nonzeros, dtype=np.float32)
+        return pressure_array
+    
+    def get_laplacian_poisson(self, boundaries=None):
+        if boundaries is None:
+            boundaries = {
+                [-1, 0, 0] : 0,
+                [1, 0, 0] : 1,
+            }
+        w, h, d = self.volume.shape
+        dx = self.len_x
+        dy = self.len_y
+        dz = self.len_z
+        len_array = np.array((dx, dy, dz), dtype=np.int32)
+
+        val_array = np.zeros(self.nonzeros * 7)
+        col_idx_array = np.zeros(self.nonzeros * 7, dtype=int)
+        row_ptr_array = np.zeros(self.nonzeros, dtype=int)
+
+        vals_n = 0
+
+        for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):
+            
+            coords = np.array((x, y, z))
+            center_c = self.volume[tuple(coords)]
+
+            if center_c == 0:
+                continue
+
+            x_min = (x == 0)
+            x_max = (x == w - 1)
+            y_min = (y == 0)
+            y_max = (y == h - 1)
+            z_min = (z == 0)
+            z_max = (z == d - 1)
+
+            key = (x_min, x_max, y_min, y_max, z_min, z_max)
+            neighbours = self.neighbours_dict[key]
+
+            total_c = 0
+
+            if z_min or z_max:
+                total_c -= 2 / dz
+
+            center_i = self._unravel(x, y, z)
+            row_ptr_array[center_i] = vals_n
+            for neighbour in neighbours:
+                neighbour_c = self.volume[tuple(coords + neighbour)]
+                if neighbour_c == 0: continue
+                face_c = np.float32(-1 / (len_array*neighbour.abs()).sum())
+                total_c += np.float32(face_c)
+                neighbour_i = self._unravel(*tuple(coords + neighbour))
+                val_array[vals_n] = face_c
+                col_idx_array[vals_n] = neighbour_i
+                vals_n += 1
+            val_array[vals_n] = -total_c
+            col_idx_array[vals_n] = self._unravel(*tuple(coords))
+            vals_n += 1
+            i += 1
+
+        val_array.resize(vals_n)
+        col_idx_array.resize(vals_n)
+
+        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
