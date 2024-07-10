@@ -1,5 +1,5 @@
-python==3.9
+#python==3.9
 pytest==7.4.4
-numpy==1.26
+numpy==1.23
 numba==0.56.2
 porespy==2.3.0
