@@ -7,8 +7,10 @@ def fast_laplacian_volume_generator(porosity_volume, pore_scale, subresolution_f
     porosity_map: must be an uint 3D ndarray, 0 represents solid, 100 pore, and 1-99
     are subresolution voxels with this indicated porosity.
     pore_scale: must be a float ndarray with 3 values, for voxel length across x, y, and
-    z axes.
-    subresolution_function: a function that takes an int between 1 and 99 and returns a float
+    z axes. Anisotropic are not implemented. The result will be valid but not physically
+    coherent.
+    subresolution_function: a function that takes an int between 1 and 99 and returns a 
+    float.
     """
 
     if subresolution_function is None:
