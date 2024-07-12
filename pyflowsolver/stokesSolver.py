@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.solver import Solver
+from pyflowsolver.solver import Solver
 
 class StokesSolver(Solver):
     def __init__(self, volume_manager):
