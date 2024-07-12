@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.sparseArray import SparseArray
+from pyflowsolver.sparseArray import SparseArray
 
 class VolumeManager():
 
