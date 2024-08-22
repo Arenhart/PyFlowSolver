@@ -1,6 +1,6 @@
 import numpy as np
 
-from src.volumeManager import VolumeManager
+from pyflowsolver.volumeManager import VolumeManager
 from tests.unit.resources.templates import (
     A_template, 
     b_template,
