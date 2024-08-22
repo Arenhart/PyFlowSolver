@@ -1,4 +1,5 @@
 import numpy as np
+from numba import njit, prange, typed
 
 from pyflowsolver.sparseArray import SparseArray
 
@@ -31,6 +32,7 @@ class VolumeManager():
             if z_min is False: neighbours.append(np.array((0,0,-1), dtype=int))
             if z_max is False: neighbours.append(np.array((0,0,1), dtype=int))
             self.neighbours_dict[key] = neighbours
+
 
     def get_linear_system(self):
 
@@ -177,6 +179,27 @@ class VolumeManager():
 
         return sparse_array, condensed_b
 
+
+    def get_sparse_system_jit(self):
+        
+        val_array = np.zeros(self.nonzeros * 7, dtype=float)
+        col_idx_array = np.zeros(self.nonzeros * 7, dtype=int)
+        row_ptr_array = np.zeros(self.nonzeros, dtype=int)
+        condensed_b = np.zeros(self.nonzeros, dtype=float)
+
+        val_array, col_idx_array = _jit_sparse_system_extraction(
+            val_array,
+            col_idx_array,
+            row_ptr_array,
+            condensed_b,
+            volume=self.volume,
+            nulls_count=self.nulls_count,
+        )
+
+        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
+
+        return sparse_array, condensed_b
+
     def _unravel(self, x, y, z):
         _, h, d = self.volume.shape
         i = z + y * d + x * d * h
@@ -290,3 +313,180 @@ class VolumeManager():
         col_idx_array.resize(vals_n)
 
         sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
+
+@njit
+def _jit_sparse_system_extraction(
+            val_array,
+            col_idx_array,
+            row_ptr_array,
+            condensed_b,
+            volume,
+            nulls_count,
+        ):
+    vals_n = np.uint16(0)
+    shape = volume.shape
+    w = np.uint16(shape[0])
+    h = np.uint16(shape[1])
+    d = np.uint16(shape[2])
+
+
+    for x in range(w): 
+        for y in range(h):
+            for z in range(d):
+                coords = np.array((x, y, z))
+                center_c = volume[x, y, z]
+
+                if center_c == 0:
+                    continue
+
+                x_min = (x == 0)
+                x_max = (x == w - 1)
+                y_min = (y == 0)
+                y_max = (y == h - 1)
+                z_min = (z == 0)
+                z_max = (z == d - 1)
+
+                x_index = 1 - x_min*1 + x_max*1
+                y_index = 1 - y_min*1 + y_max*1
+                z_index = 1 - z_min*1 + z_max*1
+
+                neighbours = _get_neighbours(x_index, y_index, z_index)
+
+                total_c = np.float32(0)
+
+                if z_min:
+                    total_c += 2 * center_c
+                    condensed_b[_unravel(x, y, z, h, d, nulls_count)] = -(2 * center_c)
+                elif z_max:
+                    total_c += 2 * center_c
+
+                center_i = _unravel(x, y, z, h, d, nulls_count)
+                row_ptr_array[center_i] = vals_n
+
+                for neighbour in neighbours:
+                    pass
+                    neighbour_c = volume[x+neighbour[0], y+neighbour[1], z+neighbour[2]]
+                    if neighbour_c == 0: continue
+                    face_c = np.float32(2 / (1 / center_c + 1 / neighbour_c))
+                    total_c += np.float32(face_c)
+                    neighbour_i = _unravel(x+neighbour[0], y+neighbour[1], z+neighbour[2], h, d, nulls_count)
+                    val_array[vals_n] = face_c
+                    col_idx_array[vals_n] = neighbour_i
+                    vals_n += 1
+                val_array[vals_n] = -total_c
+                col_idx_array[vals_n] = _unravel(x, y, z, h, d, nulls_count)
+                vals_n += 1
+
+
+    val_array = val_array[:vals_n]
+    col_idx_array = col_idx_array[:vals_n]
+
+    return val_array, col_idx_array
+
+
+@njit
+def make_unravel_function(h, d, nulls_count):
+
+    def unravel(x, y, z):
+        i = np.uint16(z) + np.uint16(y) * d + np.uint16(x) * d * h
+
+        output = i - nulls_count[i]
+
+        return output
+    
+    return unravel
+
+
+@njit
+def _unravel(x, y, z, h, d, nulls_count):
+
+    i = np.uint16(z) + np.uint16(y) * d + np.uint16(x) * d * h
+
+    output = i - nulls_count[i]
+
+    return output
+
+
+@njit
+def _get_neighbours(x, y, z):
+    #x_max, y_max, z_max
+    if (x == 0) and(y == 0) and(z == 0):
+        return list( ((1, 0, 0), (0, 1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 0) and(z == 1):
+        return list( ((1, 0, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 0) and(z == 2):
+        return list( ((1, 0, 0), (0, 1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 1) and(z == 0):
+        return list( ((1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 1) and(z == 1):
+        return list( ((1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 1) and(z == 2):
+        return list( ((1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 2) and(z == 0):
+        return list( ((1, 0, 0), (0, -1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 2) and(z == 1):
+        return list( ((1, 0, 0), (0, -1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 0) and(y == 2) and(z == 2):
+        return list( ((1, 0, 0), (0, -1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 0) and(z == 0):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 0) and(z == 1):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 0) and(z == 2):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 1) and(z == 0):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 1) and(z == 1):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 1) and(z == 2):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 2) and(z == 0):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 2) and(z == 1):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 1) and(y == 2) and(z == 2):
+        return list( ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 0) and(z == 0):
+        return list( ((-1, 0, 0), (0, 1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 0) and(z == 1):
+        return list( ((-1, 0, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 0) and(z == 2):
+        return list( ((-1, 0, 0), (0, 1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 1) and(z == 0):
+        return list( ((-1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 1) and(z == 1):
+        return list( ((-1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 1) and(z == 2):
+        return list( ((-1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 2) and(z == 0):
+        return list( ((-1, 0, 0), (0, -1, 0), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 2) and(z == 1):
+        return list( ((-1, 0, 0), (0, -1, 0), (0, 0, -1), (0, 0, 1)) )
+    #x_max, y_max, z_max
+    elif (x == 2) and(y == 2) and(z == 2):
+        return list( ((-1, 0, 0), (0, -1, 0), (0, 0, -1)) )
