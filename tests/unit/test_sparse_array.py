@@ -6,7 +6,7 @@ val = np.array((3,2,2,1,2,2,1,3,2,4,4,1,2,3), dtype = np.float32)
 col_idx = np.array((0,1,1,2,5,1,2,2,3,4,1,4,4,5), dtype=int)
 row_ptr = np.array((0,2,5,7,10,12), dtype=int)
 
-from src.sparseArray import SparseArray
+from pyflowsolver.sparseArray import SparseArray
 
 sparse_array = SparseArray(val, col_idx, row_ptr)
 
