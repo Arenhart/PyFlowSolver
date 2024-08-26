@@ -1,5 +1,7 @@
+import multiprocessing
+
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 from pyflowsolver.solver import Solver
 
@@ -34,7 +36,6 @@ class DarcySolver(Solver):
             next_x = X0 - residuals * step / diag
             next_residuals = self.calc_residuals(A, b, next_x)
             next_error = (next_residuals**2).sum()/X0.size
-            print(next_x, step, next_error, error)
             if next_error <= param("target_error"):
                 return next_x
             elif (next_error < error):# and (next_x >= 0).all():
@@ -64,7 +65,7 @@ class DarcySolver(Solver):
             residuals[row] = residual
         return residuals
 
-    def solve_jit(self, A, b, **params):
+    def solve_jit(self, A, b, parallel=False, **params):
 
         max_step = params.get("max_step", self.default_params["max_step"])
         step_adjustment = params.get("step_adjustment", self.default_params["step_adjustment"])
@@ -73,24 +74,41 @@ class DarcySolver(Solver):
         target_error = params.get("target_error", self.default_params["target_error"])
 
         X0 = np.linspace(1, 0, num=b.size, dtype=np.float32)
-        print(A.val)
-        print(A.col_idx)
-        print(A.row_ptr)
-        print(b)
 
-        X0 = self._solve_jit(
-            A.val,
-            A.col_idx,
-            A.row_ptr,
-            b,
-            max_step,
-            step_adjustment,
-            initial_step,
-            max_iterations,
-            target_error,
-            X0, 
-            )
-        print(X0)
+        if not parallel:
+            X0 = self._solve_jit(
+                A.val,
+                A.col_idx,
+                A.row_ptr,
+                b,
+                max_step,
+                step_adjustment,
+                initial_step,
+                max_iterations,
+                target_error,
+                X0, 
+                )
+        else:
+
+            if type(parallel) == int:
+                processor_n = parallel
+            else:
+                processor_n = multiprocessing.cpu_count()
+            threads = int(0.8 * processor_n)
+            X0 = self._solve_jit_parallel(
+                A.val,
+                A.col_idx,
+                A.row_ptr,
+                b,
+                max_step,
+                step_adjustment,
+                initial_step,
+                max_iterations,
+                target_error,
+                X0,
+                threads=threads,
+                )
+
         return X0
         
 
@@ -141,6 +159,57 @@ class DarcySolver(Solver):
                 return X0
         else:
             return X0
+        
+
+    @staticmethod
+    @njit
+    def _solve_jit_parallel(
+        A_val,
+        A_col_idx,
+        A_row_ptr, 
+        b,
+        max_step,
+        step_adjustment,
+        initial_step,
+        max_iterations,
+        target_error,
+        X0,
+        threads,
+    ):
+        
+        A_rows = A_row_ptr.size
+                
+        next_x = X0.copy().astype(np.float32)
+        error = np.inf
+        step = np.float32(initial_step)
+        residuals = _calc_residuals_jit_parallel(A_val, A_col_idx, A_row_ptr, b, X0, threads).astype(np.float32)
+        diag = np.zeros(A_rows, dtype = np.float32)
+        for i in range(A_rows):
+            diag[i] = _getitem(A_val, A_col_idx, A_row_ptr, i, i)
+        for _ in range(max_iterations):
+            _calc_next_x(next_x, residuals, step, diag, X0, threads)
+            next_x[:] = residuals[:]
+            next_x *= step
+            next_x /= diag
+            next_x *= np.float32(-1)
+            next_x += X0
+            next_residuals = _calc_residuals_jit_parallel(A_val, A_col_idx, A_row_ptr, b, next_x, threads)
+            next_error = (next_residuals**2).sum()/X0.size
+            if next_error <= target_error:
+                return next_x
+            elif (next_error < error) and (next_x >= 0).all():
+                residuals = next_residuals
+                X0[:] = next_x[:]
+                error = next_error
+                step += (max_step - step) * step_adjustment
+            else:
+                step = 1/step
+                step += (step + 1/max_step)
+                step = 1/step
+            if step <= 1e-10:
+                return X0
+        else:
+            return X0
 
 
 @njit
@@ -165,6 +234,45 @@ def _calc_residuals_jit(val, col_idx, row_ptr, condensed_b, X):
         residuals[row] = residual
     return residuals
 
+
+@njit
+def _calc_residuals_jit_parallel(val, col_idx, row_ptr, condensed_b, X, threads):
+
+    residuals = np.zeros(condensed_b.size, dtype=np.float32)
+    rows_n = row_ptr.size
+
+    for w in prange(threads):
+        thread_start = w * rows_n // threads
+        thread_end = (w + 1) * rows_n // threads
+        for row in range(thread_start, thread_end):
+            start = row_ptr[row]
+            if row < (row_ptr.size - 1):
+                stop = row_ptr[row + 1]
+            else:
+                stop = val.size
+
+            residual = np.float32(0)
+            for index in range(start, stop):
+                v = val[index]
+                column = col_idx[index]
+                x_val = X[column]
+                residual += v * x_val
+            residual -= condensed_b[row]
+            residuals[row] = residual
+    return residuals
+
+@njit
+def _calc_next_x(next_x, residuals, step, diag, X0, threads):
+    length = next_x.size
+    for w in prange(threads):
+        thread_start = w * length // threads
+        thread_end = (w + 1) * length // threads
+        for i in range(thread_start, thread_end):
+            next_x[i] = residuals[i]
+            next_x[i] *= step
+            next_x[i] /= diag[i]
+            next_x[i] *= -1.
+            next_x[i] += X0[i]
 
 @njit
 def _getitem(val, col_idx, row_ptr, row, col):

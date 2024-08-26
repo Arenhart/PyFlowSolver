@@ -33,6 +33,13 @@ def test_darcy_solver_jit():
     solution = solver.solve_jit(sparse_A, sparse_b)
     raveled_solution = volume_manager.ravel_sparse_solution(solution)
     np.testing.assert_allclose(raveled_solution, raveled_template, rtol=1e-08)
+
+def test_darcy_solver_jit_parallel():
+    sparse_A, sparse_b = volume_manager.get_sparse_system_jit()
+    solver = DarcySolver()
+    solution = solver.solve_jit(sparse_A, sparse_b, parallel=True)
+    raveled_solution = volume_manager.ravel_sparse_solution(solution)
+    np.testing.assert_allclose(raveled_solution, raveled_template, rtol=1e-08)
     
 def test_stokes_solver():
     pass
