@@ -23,7 +23,7 @@ def fast_laplacian_volume_generator(porosity_volume, pore_scale, subresolution_f
     darcy_pores = subresolution_function(darcy_pores)
 
     conductance_array = np.zeros_like(porosity_volume, dtype=np.float32)
-    conductance_array = edt(stokes_pores, scale=pore_scale)
+    conductance_array = edt(stokes_pores, scale=pore_scale, force_method="cpu")
     alfa = np.min(pore_scale)/2
     conductance_array = (conductance_array - alfa)**2
     conductance_array *= stokes_pores
