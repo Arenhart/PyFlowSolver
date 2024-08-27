@@ -1,4 +1,5 @@
 import multiprocessing
+import psutil
 
 import numpy as np
 from numba import njit, prange
@@ -91,10 +92,12 @@ class DarcySolver(Solver):
         else:
 
             if type(parallel) == int:
-                processor_n = parallel
+                threads = parallel
+            elif parallel is True:
+                threads = max(psutil.cpu_count(logical=False) - 2, 1)
             else:
-                processor_n = multiprocessing.cpu_count()
-            threads = int(0.8 * processor_n)
+                raise TypeError("Invalid type of parallel parameter, must be True, False or int")
+
             X0 = self._solve_jit_parallel(
                 A.val,
                 A.col_idx,
@@ -180,27 +183,34 @@ class DarcySolver(Solver):
         A_rows = A_row_ptr.size
                 
         next_x = X0.copy().astype(np.float32)
-        error = np.inf
+        error = np.array((np.inf,), dtype=np.float32)
+        next_error = np.array((np.inf,), dtype=np.float32)
         step = np.float32(initial_step)
         residuals = _calc_residuals_jit_parallel(A_val, A_col_idx, A_row_ptr, b, X0, threads).astype(np.float32)
+        next_residuals = np.empty_like(residuals)
         diag = np.zeros(A_rows, dtype = np.float32)
         for i in range(A_rows):
             diag[i] = _getitem(A_val, A_col_idx, A_row_ptr, i, i)
         for _ in range(max_iterations):
             _calc_next_x(next_x, residuals, step, diag, X0, threads)
-            next_x[:] = residuals[:]
-            next_x *= step
-            next_x /= diag
-            next_x *= np.float32(-1)
-            next_x += X0
-            next_residuals = _calc_residuals_jit_parallel(A_val, A_col_idx, A_row_ptr, b, next_x, threads)
-            next_error = (next_residuals**2).sum()/X0.size
-            if next_error <= target_error:
+            _update_resdiuals_and_error_parallel(
+                next_residuals, 
+                next_error, 
+                A_val, 
+                A_col_idx, 
+                A_row_ptr, 
+                b, 
+                next_x, 
+                threads,
+            )
+            #next_residuals = _calc_residuals_jit_parallel(A_val, A_col_idx, A_row_ptr, b, next_x, threads)
+            #next_error = (next_residuals**2).sum()/X0.size
+            if next_error[0] <= target_error:
                 return next_x
-            elif (next_error < error) and (next_x >= 0).all():
-                residuals = next_residuals
+            elif (next_error[0] < error[0]) and (next_x >= 0).all():
+                residuals[:] = next_residuals[:]
                 X0[:] = next_x[:]
-                error = next_error
+                error[0] = next_error[0]
                 step += (max_step - step) * step_adjustment
             else:
                 step = 1/step
@@ -235,7 +245,44 @@ def _calc_residuals_jit(val, col_idx, row_ptr, condensed_b, X):
     return residuals
 
 
-@njit
+@njit(parallel=True)
+def _update_resdiuals_and_error_parallel(
+    next_residuals, 
+    next_error, 
+    val, 
+    col_idx, 
+    row_ptr, 
+    condensed_b, 
+    X, 
+    threads,
+):
+    next_error_partial = np.zeros(threads, dtype=np.float32)
+    next_residuals.fill(0)
+    rows_n = row_ptr.size
+
+    for w in prange(threads):
+        thread_start = w * rows_n // threads
+        thread_end = (w + 1) * rows_n // threads
+        for row in range(thread_start, thread_end):
+            start = row_ptr[row]
+            if row < (row_ptr.size - 1):
+                stop = row_ptr[row + 1]
+            else:
+                stop = val.size
+
+            residual = np.float32(0)
+            for index in range(start, stop):
+                v = val[index]
+                column = col_idx[index]
+                x_val = X[column]
+                residual += v * x_val
+            residual -= condensed_b[row]
+            next_residuals[row] = residual
+            next_error_partial[w] += (residual**2)
+    next_error[0] = next_error_partial.sum() / X.size
+
+
+@njit(parallel=True)
 def _calc_residuals_jit_parallel(val, col_idx, row_ptr, condensed_b, X, threads):
 
     residuals = np.zeros(condensed_b.size, dtype=np.float32)
@@ -261,7 +308,8 @@ def _calc_residuals_jit_parallel(val, col_idx, row_ptr, condensed_b, X, threads)
             residuals[row] = residual
     return residuals
 
-@njit
+
+@njit(parallel=True)
 def _calc_next_x(next_x, residuals, step, diag, X0, threads):
     length = next_x.size
     for w in prange(threads):
@@ -273,6 +321,7 @@ def _calc_next_x(next_x, residuals, step, diag, X0, threads):
             next_x[i] /= diag[i]
             next_x[i] *= -1.
             next_x[i] += X0[i]
+
 
 @njit
 def _getitem(val, col_idx, row_ptr, row, col):
