@@ -7,7 +7,8 @@ class VolumeManager():
 
     def __init__(self, volume):
         self.volume = volume
-        self._calc_null_counts()
+        self.nulls_count = np.empty(volume.size, dtype=int)
+        self._calc_null_counts(self.volume, self.nulls_count)
         self._generate_neighbours_dict()
         self.nonzeros = np.count_nonzero(self.volume)
         self.len_x = 1
@@ -208,20 +209,25 @@ class VolumeManager():
 
         return output
     
-    def _calc_null_counts(self):
-        self.nulls_count = np.empty(self.volume.size, dtype=int)
+    @staticmethod
+    @njit
+    def _calc_null_counts(volume, nulls_count):
         running_zeros = 0
         i = 0
-        w, h, d = self.volume.shape
-        for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):
-            center_c = self.volume[x, y, z]
-            if center_c > 0:
-                self.nulls_count[i] = running_zeros
-                i += 1
-            else:
-                running_zeros += 1
-                self.nulls_count[i] = running_zeros
-                i += 1
+        w, h, d = volume.shape
+        for x in range(w):
+            for y in range(h):
+                for z in range(d):
+                    center_c = volume[x, y, z]
+                    if center_c > 0:
+                        nulls_count[i] = running_zeros
+                        i += 1
+                    else:
+                        running_zeros += 1
+                        nulls_count[i] = running_zeros
+                        i += 1
+        return nulls_count
+
     
     def ravel_dense_solution(self, solution):
         raveled_solution = np.zeros_like(self.volume)
