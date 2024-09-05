@@ -32,13 +32,15 @@ class DarcySolver(Solver):
         diag = np.zeros(A.shape[0], dtype = np.float32)
         for i in range(A.shape[0]):
             diag[i] = A[i, i]
+        iteration = 0
 
         for _ in range(param("max_iterations")):
+            iteration += 1
             next_x = X0 - residuals * step / diag
             next_residuals = self.calc_residuals(A, b, next_x)
             next_error = (next_residuals**2).sum()/X0.size
             if next_error <= param("target_error"):
-                return next_x
+                return next_x, next_error, iteration
             elif (next_error < error):# and (next_x >= 0).all():
                 residuals = next_residuals
                 X0 = next_x
@@ -49,7 +51,7 @@ class DarcySolver(Solver):
                 step += (step + 1/param("max_step"))
                 step = 1/step
         else:
-            return X0
+            return X0, error, iteration
 
 
     def calc_residuals(self, sparse_array, condensed_b, X):
@@ -77,7 +79,7 @@ class DarcySolver(Solver):
         X0 = np.linspace(1, 0, num=b.size, dtype=np.float32)
 
         if not parallel:
-            X0 = self._solve_jit(
+            X0, error, iterations = self._solve_jit(
                 A.val,
                 A.col_idx,
                 A.row_ptr,
@@ -98,7 +100,7 @@ class DarcySolver(Solver):
             else:
                 raise TypeError("Invalid type of parallel parameter, must be True, False or int")
 
-            X0 = self._solve_jit_parallel(
+            X0, error, iterations = self._solve_jit_parallel(
                 A.val,
                 A.col_idx,
                 A.row_ptr,
@@ -112,7 +114,7 @@ class DarcySolver(Solver):
                 threads=threads,
                 )
 
-        return X0
+        return X0, error, iterations
         
 
     @staticmethod
@@ -137,9 +139,11 @@ class DarcySolver(Solver):
         step = np.float32(initial_step)
         residuals = _calc_residuals_jit(A_val, A_col_idx, A_row_ptr, b, X0).astype(np.float32)
         diag = np.zeros(A_rows, dtype = np.float32)
+        iterations = 0
         for i in range(A_rows):
             diag[i] = _getitem(A_val, A_col_idx, A_row_ptr, i, i)
         for _ in range(max_iterations):
+            iterations += 1
             next_x[:] = residuals[:]
             next_x *= step
             next_x /= diag
@@ -148,7 +152,7 @@ class DarcySolver(Solver):
             next_residuals = _calc_residuals_jit(A_val, A_col_idx, A_row_ptr, b, next_x)
             next_error = (next_residuals**2).sum()/X0.size
             if next_error <= target_error:
-                return next_x
+                return next_x, next_error, iterations
             elif (next_error < error) and (next_x >= 0).all():
                 residuals = next_residuals
                 X0[:] = next_x[:]
@@ -159,9 +163,9 @@ class DarcySolver(Solver):
                 step += (step + 1/max_step)
                 step = 1/step
             if step <= 1e-10:
-                return X0
+                return X0, error, iterations
         else:
-            return X0
+            return X0, error, iterations
         
 
     @staticmethod
@@ -189,9 +193,11 @@ class DarcySolver(Solver):
         residuals = _calc_residuals_jit_parallel(A_val, A_col_idx, A_row_ptr, b, X0, threads).astype(np.float32)
         next_residuals = np.empty_like(residuals)
         diag = np.zeros(A_rows, dtype = np.float32)
+        iterations = 0
         for i in range(A_rows):
             diag[i] = _getitem(A_val, A_col_idx, A_row_ptr, i, i)
         for _ in range(max_iterations):
+            iterations += 1
             _calc_next_x(next_x, residuals, step, diag, X0, threads)
             _update_resdiuals_and_error_parallel(
                 next_residuals, 
@@ -206,7 +212,7 @@ class DarcySolver(Solver):
             #next_residuals = _calc_residuals_jit_parallel(A_val, A_col_idx, A_row_ptr, b, next_x, threads)
             #next_error = (next_residuals**2).sum()/X0.size
             if next_error[0] <= target_error:
-                return next_x
+                return next_x, next_error, iterations
             elif (next_error[0] < error[0]) and (next_x >= 0).all():
                 residuals[:] = next_residuals[:]
                 X0[:] = next_x[:]
@@ -217,9 +223,165 @@ class DarcySolver(Solver):
                 step += (step + 1/max_step)
                 step = 1/step
             if step <= 1e-10:
-                return X0
+                return X0, error, iterations
         else:
-            return X0
+            return X0, error, iterations
+        
+    @staticmethod
+    @njit
+    def _solve_cg(
+        A_val,
+        A_col_idx,
+        A_row_ptr, 
+        b,
+        max_iterations, # sqrt(n) for n x n system
+        target_error, # 1.0e-6
+        X0,
+        threads,
+    ):
+        #Reference: https://repository.lsu.edu/cgi/viewcontent.cgi?article=1254&context=honors_etd
+
+        x = X0.copy()
+        r = b.copy()
+        m = np.empty(1, dtype=np.float64)
+        m[0] = _square_sum_vector(r, threads) # f(x:vector) = x'*x
+        m_last = np.empty(1, dtype=np.float64)
+        p = r.copy()
+        alpha = np.empty(1, dtype=np.float64)
+        beta = np.empty(1, dtype=np.float64)
+        iteration = 0
+        for _ in range(max_iterations):
+            iteration += 1
+            alpha[0] = m[0] / _scalar_product(
+                p, 
+                A_val, 
+                A_col_idx, 
+                A_row_ptr, 
+                threads,
+                ) # scalar_product = p'*A*p
+            _add_product(x, alpha[0], p, threads) # f(x: vector, y: scalar, z:vector): x += y * z
+            _subtract_product_of_product(
+                r, 
+                alpha[0], 
+                A_val, 
+                A_col_idx, 
+                A_row_ptr,
+                p, 
+                threads,
+            ) # f(x:vector, y:scalar, z:array, k:vector): x -= y * z * k
+            m_last[0] = m[0]
+            m[0] = _square_sum_vector(r, threads)
+            beta[0] = m[0] / m_last[0]
+            _multiply_and_add(
+                p, 
+                r, 
+                beta[0], 
+                threads,
+            ) # f(x:vector, y:vector, z:scalar): x = y + z * x
+            error = np.sqrt(_square_sum_vector(r, threads) 
+                            / _square_sum_vector(b, threads)
+            )
+            if error <= target_error:
+                return x, error, iteration
+
+        return x, error, iteration
+
+
+@njit(parallel=True)
+def _square_sum_vector(v, threads): 
+    # f(v:vector) = v'*v
+    partial_sum = np.zeros(threads, dtype=np.float64)
+    n = v.size
+
+    for w in prange(threads):
+        thread_start = w * n // threads
+        thread_end = (w + 1) * n // threads
+        for i in range(thread_start, thread_end):
+            partial_sum[w] += v[i] ** 2
+    return partial_sum.sum()
+
+
+@njit(parallel=True)
+def _scalar_product(
+        v, 
+        A_val, 
+        A_col_idx, 
+        A_row_ptr, 
+        threads,
+    ): 
+    # f(v: vector[n], A:array[n, n]) = x'*A*x
+    partial_sum = np.zeros(threads, dtype=np.float64)
+    n = v.size
+
+    for w in prange(threads):
+        thread_start = w * n // threads
+        thread_end = (w + 1) * n // threads
+        for i in range(thread_start, thread_end):
+            A_start = A_row_ptr[i]
+            if (i + 1) < n:
+                A_stop = A_row_ptr[i+1]
+            else:
+                A_stop = A_val.size
+            for A_linear_index in range(A_start, A_stop):
+                j = A_col_idx[A_linear_index]
+                partial_sum[w] += v[i] * A_val[A_linear_index] * v[j]
+    return partial_sum.sum()
+
+
+@njit(parallel=True)
+def _add_product(v, x, u, threads) :
+    # f(v: vector, x: scalar, u:vector): v += x * u
+    n = v.size
+
+    for w in prange(threads):
+        thread_start = w * n // threads
+        thread_end = (w + 1) * n // threads
+        for i in range(thread_start, thread_end):
+            v[i] += x * u[i]
+
+
+@njit(parallel=True)
+def _subtract_product_of_product(
+        v, 
+        x, 
+        A_val, 
+        A_col_idx, 
+        A_row_ptr,
+        u, 
+        threads,
+    ):
+    # f(v:vector, x:scalar, A:array, u:vector): v -= x * A * u
+    n = v.size
+
+    for w in prange(threads):
+        thread_start = w * n // threads
+        thread_end = (w + 1) * n // threads
+        for i in range(thread_start, thread_end):
+            A_start = A_row_ptr[i]
+            if (i + 1) < n:
+                A_stop = A_row_ptr[i+1]
+            else:
+                A_stop = A_val.size
+            for A_linear_index in range(A_start, A_stop):
+                j = A_col_idx[A_linear_index]
+                v[i] -= x * A_val[A_linear_index] * u[j]
+
+
+@njit(parallel=True)
+def _multiply_and_add(
+        v, 
+        u, 
+        x, 
+        threads,
+    ):
+    # f(v:vector, u:vector, x:scalar): v = u + x * v
+    n = v.size
+
+    for w in prange(threads):
+        thread_start = w * n // threads
+        thread_end = (w + 1) * n // threads
+        for i in range(thread_start, thread_end):
+            v[i] = u[i] + x * v[i]
 
 
 @njit
