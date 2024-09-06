@@ -285,6 +285,150 @@ class DarcySolver(Solver):
                 return x, error, iteration
 
         return x, error, iteration
+    
+    @staticmethod
+    @njit
+    def _solve_cg(
+        A_val,
+        A_col_idx,
+        A_row_ptr, 
+        b,
+        max_iterations, # sqrt(n) for n x n system
+        target_error, # 1.0e-6
+        X0,
+        threads,
+    ):
+        #Reference: https://repository.lsu.edu/cgi/viewcontent.cgi?article=1254&context=honors_etd
+
+        x = X0.copy()
+        r = b.copy()
+        m = np.empty(1, dtype=np.float64)
+        m[0] = _square_sum_vector(r, threads) # f(x:vector) = x'*x
+        m_last = np.empty(1, dtype=np.float64)
+        p = r.copy()
+        alpha = np.empty(1, dtype=np.float64)
+        beta = np.empty(1, dtype=np.float64)
+        iteration = 0
+        for _ in range(max_iterations):
+            iteration += 1
+            alpha[0] = m[0] / _scalar_product(
+                p, 
+                A_val, 
+                A_col_idx, 
+                A_row_ptr, 
+                threads,
+                ) # scalar_product = p'*A*p
+            _add_product(x, alpha[0], p, threads) # f(x: vector, y: scalar, z:vector): x += y * z
+            _subtract_product_of_product(
+                r, 
+                alpha[0], 
+                A_val, 
+                A_col_idx, 
+                A_row_ptr,
+                p, 
+                threads,
+            ) # f(x:vector, y:scalar, z:array, k:vector): x -= y * z * k
+            m_last[0] = m[0]
+            m[0] = _square_sum_vector(r, threads)
+            beta[0] = m[0] / m_last[0]
+            _multiply_and_add(
+                p, 
+                r, 
+                beta[0], 
+                threads,
+            ) # f(x:vector, y:vector, z:scalar): x = y + z * x
+            error = np.sqrt(_square_sum_vector(r, threads) 
+                            / _square_sum_vector(b, threads)
+            )
+            if error <= target_error:
+                return x, error, iteration
+
+        return x, error, iteration
+    
+    @staticmethod
+    @njit
+    def _solve_pcg(
+        A_val,
+        A_col_idx,
+        A_row_ptr,
+        P_val,
+        P_col_idx,
+        P_row_ptr,
+        b,
+        max_iterations, # sqrt(n) for n x n system
+        target_error, # 1.0e-6
+        X0,
+        threads,
+    ):
+        #Reference: https://repository.lsu.edu/cgi/viewcontent.cgi?article=1254&context=honors_etd
+
+        x = X0.copy()
+        r = b.copy()
+        m = np.empty(1, dtype=np.float64)
+        #m[0] = _square_sum_vector(r, threads) # f(x:vector) = x'*x
+        m[0] = _scalar_product(
+                p, 
+                P_val, 
+                P_col_idx, 
+                P_row_ptr, 
+                threads,
+                ) # scalar_product = p'*A*p
+        m_last = np.empty(1, dtype=np.float64)
+        p = r.copy()
+        _vector_array_multiply(
+            p, 
+            P_val, 
+            P_col_idx, 
+            P_row_ptr, 
+            threads,
+            ) # f(v, A) = v*A
+        alpha = np.empty(1, dtype=np.float64)
+        beta = np.empty(1, dtype=np.float64)
+        iteration = 0
+        for _ in range(max_iterations):
+            iteration += 1
+            alpha[0] = m[0] / _scalar_product(
+                p, 
+                A_val, 
+                A_col_idx, 
+                A_row_ptr, 
+                threads,
+                ) # scalar_product = p'*A*p
+            _add_product(x, alpha[0], p, threads) # f(x: vector, y: scalar, z:vector): x += y * z
+            _subtract_product_of_product(
+                r, 
+                alpha[0], 
+                A_val, 
+                A_col_idx, 
+                A_row_ptr,
+                p, 
+                threads,
+            ) # f(x:vector, y:scalar, z:array, k:vector): x -= y * z * k
+            m_last[0] = m[0]
+            m[0] = _scalar_product(
+                p, 
+                P_val, 
+                P_col_idx, 
+                P_row_ptr, 
+                threads,
+                ) # scalar_product = p'*A*p
+            beta[0] = m[0] / m_last[0]
+            _multiply_array_and_add(
+                p, 
+                r, 
+                beta[0],
+                P_val, 
+                P_col_idx, 
+                P_row_ptr,
+                threads,
+            ) # f(x:vector, y:vector, z:scalar, A:array): x = A * y + z * x
+            error = np.sqrt(_square_sum_vector(r, threads) 
+                            / _square_sum_vector(b, threads)
+            )
+            if error <= target_error:
+                return x, error, iteration
+
+        return x, error, iteration
 
 
 @njit(parallel=True)
