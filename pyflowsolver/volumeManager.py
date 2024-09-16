@@ -373,7 +373,7 @@ def _jit_sparse_system_extraction(
                     pass
                     neighbour_c = volume[x+neighbour[0], y+neighbour[1], z+neighbour[2]]
                     if neighbour_c == 0: continue
-                    face_c = np.float32(2 / (1 / center_c + 1 / neighbour_c))
+                    face_c = np.float32(1 / (2 / center_c + 2 / neighbour_c))
                     total_c += np.float32(face_c)
                     neighbour_i = _unravel(x+neighbour[0], y+neighbour[1], z+neighbour[2], h, d, nulls_count)
                     val_array[vals_n] = face_c
