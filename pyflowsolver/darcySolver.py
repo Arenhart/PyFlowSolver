@@ -11,7 +11,7 @@ class DarcySolver(Solver):
         "inverse_diagonal",
     ]
     DEFAULT_PARAMS = {
-        "max_iterations" : 5000,
+        "max_iterations" : 500000,
         "target_error" : 1e-07,
     }
 
@@ -73,6 +73,9 @@ class DarcySolver(Solver):
                 A_col_idx=self.a_sparse_array["col_idx"],
                 A_row_ptr=self.a_sparse_array["row_ptr"],
             )
+        else:
+            raise Exception
+
         self.preconditioner = {
             "val": P_val,
             "col_idx": P_col_idx,
@@ -93,6 +96,7 @@ class DarcySolver(Solver):
         )
         return self.x, self.error, self.iteration
 
+
     def solve_pcg(self):
 
         self.x, self.error, self.iteration = self._solve_pcg(
@@ -106,13 +110,13 @@ class DarcySolver(Solver):
             max_iterations=self.params["max_iterations"], # sqrt(V)
             target_error=self.params["target_error"], # 1.0e-6
             X0=np.zeros_like(self.b_array),
-            threads=4
+            threads=1
         )
         return self.x, self.error, self.iteration
 
 
     @staticmethod
-    @njit(parallel=True)
+    @njit
     def _get_diagonal_preconditioner(
         A_val, 
         A_col_idx, 
@@ -399,9 +403,6 @@ def _get_diagonal_preconditioner(
                 v = A_val[linear_index]
                 P_val[row] = 1 / v
     return P_val, P_col_idx, P_row_ptr
-
-
-
 
 
 @njit  #
