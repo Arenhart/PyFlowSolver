@@ -67,6 +67,53 @@ class NetworkManager():
         return pressure
 
 
+    def get_flow_rate(self, pressures):
+        inlet_flow_total = np.float64(0.0)
+        outlet_flow_total = np.float64(0.0)
+        border_pore = np.logical_or(self.inlets, self.outlets)
+        throats_n = self.cond.size
+
+        flow = np.zeros(throats_n, dtype=np.float64)
+        delta_p = np.zeros(throats_n, dtype=np.float64)
+        inlet_flow = np.zeros(throats_n, dtype=np.float64)
+        outlet_flow = np.zeros(throats_n, dtype=np.float64)
+        for throat in range(throats_n):
+            p0 = self.conn[throat, 0]
+            p1 = self.conn[throat, 1]
+            c = self.cond[throat]
+            delta_p[throat] = np.abs(p0 - p1)
+            flow[throat] = delta_p[throat] * c
+
+        border_pore = np.logical_or(self.inlets, self.outlets)
+        for throat in range(throats_n):
+            p0 = self.conn[throat, 0]
+            p1 = self.conn[throat, 1]
+            c = self.cond[throat]
+            if self.inlets[p0] and (not border_pore[p1]):
+                inlet_flow_total += c * (
+                    np.float64(101325.0) - pressures[p1]
+                )
+                inlet_flow[throat] = c * (
+                    np.float64(101325.0) - pressures[p1]
+                )
+            if self.inlets[p1] and (not border_pore[p0]):
+                inlet_flow_total += c * (
+                    np.float64(101325.0) - pressures[p0]
+                )
+                inlet_flow[throat] = c * (
+                    np.float64(101325.0) - pressures[p0]
+                )
+            if self.outlets[p0] and (not border_pore[p1]):
+                outlet_flow_total += c * (pressures[p1])
+                outlet_flow[throat] = c * (pressures[p1])
+            if self.outlets[p1] and (not border_pore[p0]):
+                outlet_flow_total += c * (pressures[p0])
+                outlet_flow[throat] = c * (pressures[p0])
+
+        flow_rate = (outlet_flow_total + inlet_flow_total) / 2
+        return flow_rate
+
+
     @staticmethod
     @njit
     def _calc_sparse_system(conn, cond, inlets, outlets):
@@ -74,8 +121,8 @@ class NetworkManager():
         # conn array(n, 2)
         # assumes inlet pressure = 1 and outlet pressure = 0
 
-        inlets *= np.int32(1) - outlets
-        border = inlets + outlets
+        inlets = np.logical_and(inlets, np.logical_not(outlets))
+        border = np.logical_or(inlets, outlets)
 
         n_p_total = inlets.size
         n_p_in = inlets.sum()
