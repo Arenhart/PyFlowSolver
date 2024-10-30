@@ -18,7 +18,7 @@ raveled_template = volume_manager.ravel_dense_solution(solution_template)
 def test_darcy_solver():
     sparse_A, sparse_b = volume_manager.get_sparse_system()
     solver = DarcySolver()
-    solution = solver.solve(sparse_A, sparse_b)
+    solution, _, _ = solver.solve(sparse_A, sparse_b)
     raveled_solution = volume_manager.ravel_sparse_solution(solution)
     np.testing.assert_allclose(raveled_solution, raveled_template, rtol=1e-06)
 
