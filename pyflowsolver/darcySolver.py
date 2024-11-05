@@ -93,6 +93,7 @@ class DarcySolver(Solver):
             max_iterations=self.params["max_iterations"], # sqrt(V)
             target_error=self.params["target_error"], # 1.0e-6
             X0=np.zeros_like(self.b_array),
+            threads=1,
         )
         return self.x, self.error, self.iteration
 
@@ -151,13 +152,14 @@ class DarcySolver(Solver):
         max_iterations, # sqrt(V)
         target_error, # 1.0e-6
         X0,
+        threads,
     ):
         #Reference: https://repository.lsu.edu/cgi/viewcontent.cgi?article=1254&context=honors_etd
 
         x = X0.copy()
         r = b.copy()
         m = np.empty(1, dtype=np.float64)
-        m[0] = _square_sum_vector(r) # f(x:vector) = x'*x
+        m[0] = _square_sum_vector(r, threads) # f(x:vector) = x'*x
         m_last = np.empty(1, dtype=np.float64)
         p = r.copy()
         alpha = np.empty(1, dtype=np.float64)
@@ -170,19 +172,21 @@ class DarcySolver(Solver):
                 A_val, 
                 A_col_idx, 
                 A_row_ptr,
+                threads,
                 ) # scalar_product = p'*A*p
-            _add_product(x, alpha[0], p) # f(x: vector, y: scalar, z:vector): x += y * z
+            _add_product(x, alpha[0], p, threads) # f(x: vector, y: scalar, z:vector): x += y * z
             _recalc_residuals_jit(r, A_val, A_col_idx, A_row_ptr, b, x)
             m_last[0] = m[0]
-            m[0] = _square_sum_vector(r)
+            m[0] = _square_sum_vector(r, threads)
             beta[0] = m[0] / m_last[0]
             _multiply_and_add(
                 p, 
                 r, 
                 beta[0],
+                threads,
             ) # f(x:vector, y:vector, z:scalar): x = y + z * x
-            error = np.sqrt(_square_sum_vector(r) 
-                            / _square_sum_vector(b)
+            error = np.sqrt(_square_sum_vector(r, threads) 
+                            / _square_sum_vector(b, threads)
             )
             if error <= target_error:
                 return x, error, iteration

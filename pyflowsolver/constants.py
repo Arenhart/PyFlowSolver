@@ -1,0 +1,4 @@
+SOLID = 0
+PORE = 1
+INLET = 2
+OUTLET = 3

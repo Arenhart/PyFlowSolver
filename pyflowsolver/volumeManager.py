@@ -1,16 +1,29 @@
 import numpy as np
 from numba import njit, prange, typed
 
-from pyflowsolver.sparseArray import SparseArray
+from pyflowsolver.constants import SOLID, PORE, INLET, OUTLET
 
 class VolumeManager():
 
-    def __init__(self, volume):
+    def __init__(self, volume, boundary_volume=None):
+        """
+        volume: A float ndarray with the local conductivity of each voxel
+        boundary_volume: A uint8 ndarray, same shape as volume, with the 
+            following value convention:
+            SOLID = 0
+            PORE = 1
+            INLET = 2
+            OUTLET = 3
+        """
         self.volume = volume
+        self.boundary_volume = boundary_volume
         self.nulls_count = np.empty(volume.size, dtype=int)
-        self._calc_null_counts(self.volume, self.nulls_count)
+        if boundary_volume is None:
+            self._calc_null_counts(self.volume, self.nulls_count)
+        else:
+            self._calc_null_counts_irregular(self.boundary_volume, self.nulls_count)
         self._generate_neighbours_dict()
-        self.nonzeros = np.count_nonzero(self.volume)
+        self.nonzeros = self.volume.size - self.nulls_count[-1]
         self.len_x = 1
         self.len_y = 1
         self.len_z = 1
@@ -119,7 +132,11 @@ class VolumeManager():
         val_array.resize(vals_n)
         col_idx_array.resize(vals_n)
 
-        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
+        sparse_array = {
+            "val" : val_array,
+            "col_idx" : col_idx_array,
+            "row_ptr" : row_ptr_array,
+        }
 
         return sparse_array, condensed_b
     
@@ -176,7 +193,11 @@ class VolumeManager():
         val_array.resize(vals_n)
         col_idx_array.resize(vals_n)
 
-        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
+        sparse_array = {
+            "val" : val_array,
+            "col_idx" : col_idx_array,
+            "row_ptr" : row_ptr_array,
+        }
 
         return sparse_array, condensed_b
 
@@ -188,16 +209,29 @@ class VolumeManager():
         row_ptr_array = np.zeros(self.nonzeros, dtype=int)
         condensed_b = np.zeros(self.nonzeros, dtype=float)
 
+        if self.boundary_volume is not None:
+            irregular_boundary = True
+            boundary_volume=self.boundary_volume
+        else:
+            irregular_boundary = False
+            boundary_volume=np.zeros((1, 1, 1), dtype=np.uint8)
+
         val_array, col_idx_array = _jit_sparse_system_extraction(
             val_array,
             col_idx_array,
             row_ptr_array,
             condensed_b,
-            volume=self.volume,
+            conductivity_volume=self.volume,
             nulls_count=self.nulls_count,
+            irregular_boundary=irregular_boundary,
+            boundary_volume=boundary_volume,
         )
 
-        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
+        sparse_array = {
+            "val" : val_array,
+            "col_idx" : col_idx_array,
+            "row_ptr" : row_ptr_array,
+        }
 
         return sparse_array, condensed_b
 
@@ -226,7 +260,25 @@ class VolumeManager():
                         running_zeros += 1
                         nulls_count[i] = running_zeros
                         i += 1
-        return nulls_count
+    
+
+    @staticmethod
+    @njit
+    def _calc_null_counts_irregular(boundary_volume, nulls_count):
+        running_zeros = 0
+        i = 0
+        w, h, d = boundary_volume.shape
+        for x in range(w):
+            for y in range(h):
+                for z in range(d):
+                    center_element = boundary_volume[x, y, z]
+                    if center_element == PORE:
+                        nulls_count[i] = running_zeros
+                        i += 1
+                    else:
+                        running_zeros += 1
+                        nulls_count[i] = running_zeros
+                        i += 1
 
     
     def ravel_dense_solution(self, solution):
@@ -244,9 +296,16 @@ class VolumeManager():
         w, h, d = raveled_solution.shape
         i = 0
         for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):
-            if self.volume[x, y, z] > np.float32(0):
-                raveled_solution[x, y, z] = solution[i]
-                i += 1
+            if self.boundary_volume is None:
+                if self.volume[x, y, z] > np.float32(0):
+                    raveled_solution[x, y, z] = solution[i]
+                    i += 1
+            elif self.boundary_volume is not None:
+                if self.boundary_volume[x, y, z] == PORE:
+                    raveled_solution[x, y, z] = solution[i]
+                    i += 1
+                if self.boundary_volume[x, y, z] == INLET:
+                    raveled_solution[x, y, z] = np.float32(1)
 
         return raveled_solution
 
@@ -259,11 +318,7 @@ class VolumeManager():
         return pressure_array
     
     def get_laplacian_poisson(self, boundaries=None):
-        if boundaries is None:
-            boundaries = {
-                [-1, 0, 0] : 0,
-                [1, 0, 0] : 1,
-            }
+        
         w, h, d = self.volume.shape
         dx = self.len_x
         dy = self.len_y
@@ -318,7 +373,11 @@ class VolumeManager():
         val_array.resize(vals_n)
         col_idx_array.resize(vals_n)
 
-        sparse_array = SparseArray(val_array, col_idx_array, row_ptr_array)
+        sparse_array = {
+            "val" : val_array,
+            "col_idx" : col_idx_array,
+            "row_ptr" : row_ptr_array,
+        }
 
 @njit
 def _jit_sparse_system_extraction(
@@ -326,24 +385,28 @@ def _jit_sparse_system_extraction(
             col_idx_array,
             row_ptr_array,
             condensed_b,
-            volume,
+            conductivity_volume,
             nulls_count,
+            irregular_boundary,
+            boundary_volume,
         ):
     vals_n = np.uint16(0)
-    shape = volume.shape
+    shape = conductivity_volume.shape
     w = np.uint16(shape[0])
     h = np.uint16(shape[1])
     d = np.uint16(shape[2])
 
-
     for x in range(w): 
         for y in range(h):
             for z in range(d):
-                coords = np.array((x, y, z))
-                center_c = volume[x, y, z]
+                center_c = conductivity_volume[x, y, z]
 
                 if center_c == 0:
                     continue
+
+                if irregular_boundary:
+                    if boundary_volume[x, y, z] != PORE:
+                        continue
 
                 x_min = (x == 0)
                 x_max = (x == w - 1)
@@ -360,29 +423,47 @@ def _jit_sparse_system_extraction(
 
                 total_c = np.float32(0)
 
-                if z_min:
-                    total_c += 2 * center_c
-                    condensed_b[_unravel(x, y, z, h, d, nulls_count)] = -(2 * center_c)
-                elif z_max:
-                    total_c += 2 * center_c
+                if not irregular_boundary:
+                    if z_min:
+                        total_c += 2 * center_c
+                        condensed_b[_unravel(x, y, z, h, d, nulls_count)] = -(2 * center_c)
+                    elif z_max:
+                        total_c += 2 * center_c
 
                 center_i = _unravel(x, y, z, h, d, nulls_count)
                 row_ptr_array[center_i] = vals_n
 
                 for neighbour in neighbours:
-                    pass
-                    neighbour_c = volume[x+neighbour[0], y+neighbour[1], z+neighbour[2]]
-                    if neighbour_c == 0: continue
-                    face_c = np.float32(2 / (1 / center_c + 1 / neighbour_c))
-                    total_c += np.float32(face_c)
-                    neighbour_i = _unravel(x+neighbour[0], y+neighbour[1], z+neighbour[2], h, d, nulls_count)
-                    val_array[vals_n] = face_c
-                    col_idx_array[vals_n] = neighbour_i
-                    vals_n += 1
+                    neighbour_c = conductivity_volume[x+neighbour[0], y+neighbour[1], z+neighbour[2]]
+                    if irregular_boundary:
+                        neighbour_element = boundary_volume[x+neighbour[0], y+neighbour[1], z+neighbour[2]]
+                    else: #not irregular_boundary
+                        if neighbour_c == 0:
+                            neighbour_element = SOLID
+                        else:
+                            neighbour_element = PORE
+                    
+                    if neighbour_element == SOLID:
+                        continue
+
+                    elif neighbour_element == PORE:
+                        face_c = np.float32(2 / (1 / center_c + 1 / neighbour_c))
+                        total_c += np.float32(face_c)
+                        neighbour_i = _unravel(x+neighbour[0], y+neighbour[1], z+neighbour[2], h, d, nulls_count)
+                        val_array[vals_n] = face_c
+                        col_idx_array[vals_n] = neighbour_i
+                        vals_n += 1
+
+                    elif neighbour_element in [INLET, OUTLET]:
+                        face_c = np.float32(2 * center_c)
+                        total_c += np.float32(face_c)
+                        #center element is always PORE
+                        if neighbour_element == INLET:
+                            condensed_b[_unravel(x, y, z, h, d, nulls_count)] = -face_c
+
                 val_array[vals_n] = -total_c
                 col_idx_array[vals_n] = _unravel(x, y, z, h, d, nulls_count)
                 vals_n += 1
-
 
     val_array = val_array[:vals_n]
     col_idx_array = col_idx_array[:vals_n]
