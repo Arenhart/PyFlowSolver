@@ -7,7 +7,6 @@ from pyflowsolver.constants import SOLID, PORE, INLET, OUTLET
 def fast_laplacian_volume_generator(
         porosity_volume, 
         pore_scale,
-        boundary_volume=None,
         subresolution_function=None,
         closed_border=True,
         ):
@@ -53,7 +52,6 @@ def fast_laplacian_volume_generator(
     alfa = np.min(pore_scale)/2
     conductance_array = (conductance_array - alfa)**2
     conductance_array *= stokes_pores
-
     conductance_array += darcy_pores
 
     return conductance_array
