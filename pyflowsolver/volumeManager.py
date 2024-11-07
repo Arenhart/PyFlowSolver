@@ -1,13 +1,18 @@
 import numpy as np
+import scipy as sc
 from numba import njit, prange, typed
 
 from pyflowsolver.constants import SOLID, PORE, INLET, OUTLET
+from pyflowsolver.fastLaplacian import fast_laplacian_volume_generator
 
 class VolumeManager():
 
-    def __init__(self, volume, boundary_volume=None):
+    def __init__(self, volume, scale=1, boundary_volume=None):
         """
-        volume: A float ndarray with the local conductivity of each voxel
+        volume: A float ndarray with the local conductivity or a porosity map,
+            if porosity_map, should run convert_pore_volume_to_laplacian_conductivity
+            afterwards
+        dimension: Single number or tuple for the voxel dimension
         boundary_volume: A uint8 ndarray, same shape as volume, with the 
             following value convention:
             SOLID = 0
@@ -22,11 +27,18 @@ class VolumeManager():
             self._calc_null_counts(self.volume, self.nulls_count)
         else:
             self._calc_null_counts_irregular(self.boundary_volume, self.nulls_count)
+            self.filter_connected_volume()
         self._generate_neighbours_dict()
         self.nonzeros = self.volume.size - self.nulls_count[-1]
-        self.len_x = 1
-        self.len_y = 1
-        self.len_z = 1
+        try: 
+            iter(scale)
+        except:
+            self.scale = (
+                scale,
+            ) * 3
+        else:
+            self.scale = np.float32(scale[:3])
+
 
     def _generate_neighbours_dict(self):
         self.neighbours_dict = {}
@@ -46,6 +58,47 @@ class VolumeManager():
             if z_min is False: neighbours.append(np.array((0,0,-1), dtype=int))
             if z_max is False: neighbours.append(np.array((0,0,1), dtype=int))
             self.neighbours_dict[key] = neighbours
+
+
+    def convert_pore_volume_to_laplacian_conductivity(self, porosity_map=False):
+        if not porosity_map:
+            self.volume = (self.boundary_volume >= 1)*100
+            self.volume = fast_laplacian_volume_generator(
+                self.volume, 
+                self.scale, 
+                )
+        else:
+            raise("Not implemented yet")
+
+
+    def filter_connected_volume(self):
+        labeled_volume, _ = sc.ndimage.label(self.boundary_volume > 0)
+        self._filter_connected_volume(self.boundary_volume, labeled_volume)
+
+
+    @staticmethod
+    @njit
+    def _filter_connected_volume(boundary_volume, labels):
+        w, h, d = boundary_volume.shape
+        inlet_set = set()
+        outlet_set = set()
+        for i in range(w):
+            for j in range(h):
+                for k in range(d):
+                    if boundary_volume[i, j, k] == INLET:
+                        label = labels[i, j, k]
+                        if label != 0:
+                            inlet_set.add(label)
+                    elif boundary_volume[i, j, k] == OUTLET:
+                        label = labels[i, j, k]
+                        if label != 0:
+                            outlet_set.add(label)
+        connected_labels = inlet_set.intersection(outlet_set)
+        for i in range(w):
+            for j in range(h):
+                for k in range(d):
+                    if labels[i, j, k] not in connected_labels:
+                        boundary_volume[i,j,k] = 0
 
 
     def get_linear_system(self):
@@ -320,9 +373,7 @@ class VolumeManager():
     def get_laplacian_poisson(self, boundaries=None):
         
         w, h, d = self.volume.shape
-        dx = self.len_x
-        dy = self.len_y
-        dz = self.len_z
+        dx, dy, dz = self.scale
         len_array = np.array((dx, dy, dz), dtype=np.int32)
 
         val_array = np.zeros(self.nonzeros * 7)
