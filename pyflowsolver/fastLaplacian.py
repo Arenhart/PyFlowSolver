@@ -31,7 +31,6 @@ def fast_laplacian_volume_generator(
     stokes_pores = (porosity_volume == 100)
     darcy_pores = porosity_volume * darcy_pores
     darcy_pores = subresolution_function(darcy_pores)
-
     #conductance_array = np.zeros_like(porosity_volume, dtype=np.float32)
     w, h, d = stokes_pores.shape
     if closed_border is True:
@@ -39,14 +38,14 @@ def fast_laplacian_volume_generator(
         stokes_pores_with_border[1:-1, 1:-1, :] = stokes_pores
         conductance_array = edt(
             stokes_pores_with_border, 
-            scale=pore_scale, 
+            scale=tuple(pore_scale),
             force_method="cpu",
             )
         conductance_array = conductance_array[1:-1, 1:-1, :]
     else: #closed border is false
         conductance_array = edt(
-            stokes_pores_with_border, 
-            scale=pore_scale, 
+            stokes_pores, 
+            scale=tuple(pore_scale),
             force_method="cpu",
             )
     alfa = np.min(pore_scale)/2
