@@ -65,7 +65,8 @@ class VolumeManager():
             self.volume = (self.boundary_volume >= 1)*100
             self.volume = fast_laplacian_volume_generator(
                 self.volume, 
-                self.scale, 
+                self.scale,
+                closed_border=False, 
                 )
         else:
             raise("Not implemented yet")
@@ -313,7 +314,6 @@ class VolumeManager():
                         running_zeros += 1
                         nulls_count[i] = running_zeros
                         i += 1
-    
 
     @staticmethod
     @njit
@@ -371,7 +371,7 @@ class VolumeManager():
         return pressure_array
     
     def get_laplacian_poisson(self, boundaries=None):
-        
+        # Unfinished function
         w, h, d = self.volume.shape
         dx, dy, dz = self.scale
         len_array = np.array((dx, dy, dz), dtype=np.int32)
@@ -429,6 +429,68 @@ class VolumeManager():
             "col_idx" : col_idx_array,
             "row_ptr" : row_ptr_array,
         }
+
+    def get_conductivity(self, pressure_volume):
+        conductivity = self._get_flow(
+            pressure_volume, 
+            self.boundary_volume, 
+            conductivity_volume=self.volume, 
+            scale=self.scale,
+        )
+        return conductivity
+
+    @staticmethod
+    @njit
+    def _get_flow(
+            pressure_volume, 
+            boundary_volume, 
+            conductivity_volume, 
+            scale, 
+            pressure_difference=1,
+            ):
+        w, h, d = pressure_volume.shape
+        area_0 = scale[1] * scale[2] / scale[0]
+        area_1 = scale[0] * scale[2] / scale[1]
+        area_2 = scale[0] * scale[1] / scale[2]
+        in_flow = np.float64(0)
+        out_flow = np.float64(0)
+        for x1 in range(w-1):
+            for y1 in range(h-1):
+                for z1 in range(d-1):
+                    center_boundary = boundary_volume[x1, y1, z1]
+                    if center_boundary == SOLID:
+                        continue
+                    for (x2, y2, z2, area) in ((x1+1, y1, z1, area_0), (x1, y1+1, z1, area_1), (x1, y1, z1+1, area_2)):
+                        neighbour_boundary = boundary_volume[x2, y2, z2]
+                        center_pressure = pressure_volume[x1, y1, z1]
+                        neighbour_pressure = pressure_volume[x2, y2, z2]
+                        if neighbour_boundary == SOLID:
+                            continue
+                        # Flow from neighbour to center
+                        if ((center_boundary == PORE and neighbour_boundary == INLET)
+                                or (center_boundary == OUTLET and neighbour_boundary == PORE)):
+                            delta_p = neighbour_pressure - center_pressure
+                        # Flow from center to neighbour
+                        elif ((center_boundary == INLET and neighbour_boundary == PORE)
+                                or (center_boundary == PORE and neighbour_boundary == OUTLET)):
+                            delta_p = center_pressure - neighbour_pressure
+                        else:
+                            continue
+                        if center_boundary == PORE:
+                            conductivity = 2 * conductivity_volume[x1, y1, z1]
+                        elif neighbour_boundary == PORE:
+                            conductivity = 2 * conductivity_volume[x2, y2, z2]
+
+                        flow = delta_p * conductivity * area
+
+                        if (center_boundary == INLET) or (neighbour_boundary) == INLET:
+                            in_flow += flow
+                        else:
+                            out_flow += flow
+        relative_flow = (in_flow + out_flow) / 2 # flow/pressure_difference
+        flow = relative_flow * pressure_difference
+        return flow
+
 
 @njit
 def _jit_sparse_system_extraction(
