@@ -27,7 +27,7 @@ class VolumeManager():
             self._calc_null_counts(self.volume, self.nulls_count)
         else:
             self._calc_null_counts_irregular(self.boundary_volume, self.nulls_count)
-            self.filter_connected_volume()
+        self.filter_connected_volume()
         self._generate_neighbours_dict()
         self.nonzeros = self.volume.size - self.nulls_count[-1]
         try: 
@@ -74,12 +74,15 @@ class VolumeManager():
 
     def filter_connected_volume(self):
         labeled_volume, _ = sc.ndimage.label(self.boundary_volume > 0)
-        self._filter_connected_volume(self.boundary_volume, labeled_volume)
+        if self.boundary_volume is not None:    
+            self._filter_connected_volume_irregular(self.boundary_volume, labeled_volume)
+        else:  
+            self._filter_connected_volume(self.volume, labeled_volume)
 
 
     @staticmethod
     @njit
-    def _filter_connected_volume(boundary_volume, labels):
+    def _filter_connected_volume_irregular(boundary_volume, labels):
         w, h, d = boundary_volume.shape
         inlet_set = set()
         outlet_set = set()
@@ -100,6 +103,21 @@ class VolumeManager():
                 for k in range(d):
                     if labels[i, j, k] not in connected_labels:
                         boundary_volume[i,j,k] = 0
+
+
+    @staticmethod
+    @njit
+    def _filter_connected_volume(pore_volume, labels):
+        w, h, d = labels.shape
+        inlet_set = set(np.unique(labels[:, :, 0]))
+        outlet_set = set(np.unique(labels[:, :, -1]))
+        connected_labels = inlet_set.intersection(outlet_set)
+
+        for i in range(w):
+            for j in range(h):
+                for k in range(d):
+                    if labels[i, j, k] not in connected_labels:
+                        pore_volume[i,j,k] = 0
 
 
     def get_linear_system(self):
