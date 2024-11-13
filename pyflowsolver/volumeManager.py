@@ -73,10 +73,12 @@ class VolumeManager():
 
 
     def filter_connected_volume(self):
-        labeled_volume, _ = sc.ndimage.label(self.boundary_volume > 0)
-        if self.boundary_volume is not None:    
+        
+        if self.boundary_volume is not None:
+            labeled_volume, _ = sc.ndimage.label(self.boundary_volume > 0)
             self._filter_connected_volume_irregular(self.boundary_volume, labeled_volume)
-        else:  
+        else: 
+            labeled_volume, _ = sc.ndimage.label(self.volume > 0)
             self._filter_connected_volume(self.volume, labeled_volume)
 
 
