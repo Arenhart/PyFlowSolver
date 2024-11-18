@@ -23,11 +23,11 @@ class VolumeManager():
         self.volume = volume
         self.boundary_volume = boundary_volume
         self.nulls_count = np.empty(volume.size, dtype=int)
+        self.filter_connected_volume()
         if boundary_volume is None:
             self._calc_null_counts(self.volume, self.nulls_count)
         else:
             self._calc_null_counts_irregular(self.boundary_volume, self.nulls_count)
-        self.filter_connected_volume()
         self._generate_neighbours_dict()
         self.nonzeros = self.volume.size - self.nulls_count[-1]
         try: 
