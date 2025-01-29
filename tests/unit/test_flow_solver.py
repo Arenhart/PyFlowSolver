@@ -36,21 +36,20 @@ def test_darcy_solver():
 
 def test_irregular_boundary_solver():
 
-    boundary_volume = np.ones((5,5,5), dtype=np.uint8)
+    boundary_volume = np.zeros((5,5,5), dtype=np.uint8)
+    boundary_volume[1:-1, :, 1:-1] = PORE
+    boundary_volume[1:-1,0,1:-1] = INLET
+    boundary_volume[1,1,1] = INLET
+    boundary_volume[1,0,1] = PORE
+    boundary_volume[1:-1, -1, 1:-1] = OUTLET
 
-    conductance_array = edt(
-            boundary_volume, 
-            scale=(1.2, 1.2, 1.2), 
-            force_method="cpu",
-            closed_border=True,
-            )
+    con_vol = (boundary_volume>=1)*100
 
-    boundary_volume[:,0,:] = 2
-    boundary_volume[:, -1, :] = 3
-    boundary_volume[2, 2, 2] = 0
+    scale = (0.02,) * 3
+
     volume_manager = VolumeManager(
-        boundary_volume>0, 
-        scale=1.2, 
+        con_vol, 
+        scale=scale, 
         boundary_volume=boundary_volume,
         )
     volume_manager.convert_pore_volume_to_laplacian_conductivity()
