@@ -23,6 +23,7 @@ class VolumeManager():
         self.volume = volume
         self.boundary_volume = boundary_volume
         self.nulls_count = np.empty(volume.size, dtype=int)
+        self.w, self.h, self.d = volume.shape
         self.filter_connected_volume()
         if boundary_volume is None:
             self._calc_null_counts(self.volume, self.nulls_count)
@@ -75,12 +76,11 @@ class VolumeManager():
     def filter_connected_volume(self):
         
         if self.boundary_volume is not None:
-            labeled_volume, _ = sc.ndimage.label(self.boundary_volume > 0)
+            labeled_volume, _ = sc.ndimage.label(self.boundary_volume == PORE)
             self._filter_connected_volume_irregular(self.boundary_volume, labeled_volume)
         else: 
             labeled_volume, _ = sc.ndimage.label(self.volume > 0)
             self._filter_connected_volume(self.volume, labeled_volume)
-
 
     @staticmethod
     @njit
@@ -91,20 +91,37 @@ class VolumeManager():
         for i in range(w):
             for j in range(h):
                 for k in range(d):
-                    if boundary_volume[i, j, k] == INLET:
-                        label = labels[i, j, k]
-                        if label != 0:
-                            inlet_set.add(label)
-                    elif boundary_volume[i, j, k] == OUTLET:
-                        label = labels[i, j, k]
-                        if label != 0:
-                            outlet_set.add(label)
+                    if boundary_volume[i, j, k] in (INLET, OUTLET):
+                        neighbours = _get_neighbours(i, j, k, boundary_volume)
+                        for neighbour in neighbours:
+                            ni = i + neighbour[0]
+                            nj = j + neighbour[1]
+                            nk = k + neighbour[2]
+                            if boundary_volume[ni, nj, nk] == PORE:
+                                label = labels[ni, nj, nk]
+                                if boundary_volume[i, j, k] == INLET:
+                                    inlet_set.add(label)
+                                elif boundary_volume[i, j, k] == OUTLET:
+                                    outlet_set.add(label)
+
         connected_labels = inlet_set.intersection(outlet_set)
         for i in range(w):
             for j in range(h):
                 for k in range(d):
-                    if labels[i, j, k] not in connected_labels:
-                        boundary_volume[i,j,k] = 0
+                    if boundary_volume[i, j, k] == PORE:
+                        if labels[i, j, k] not in connected_labels:
+                            boundary_volume[i, j, k] = 0
+                    elif boundary_volume[i, j, k] in (INLET, OUTLET):
+                        neighbours = _get_neighbours(i, j, k, boundary_volume)
+                        for neighbour in neighbours:
+                            ni = i + neighbour[0]
+                            nj = j + neighbour[1]
+                            nk = k + neighbour[2]
+                            if labels[ni, nj, nk] in connected_labels:
+                                break
+                        else:
+                            boundary_volume[i, j, k] = 0
+
 
 
     @staticmethod
@@ -122,16 +139,37 @@ class VolumeManager():
                         pore_volume[i,j,k] = 0
 
 
+    def get_neighbours(self, x, y, z):    
+        x_min = (x == 0)
+        x_max = (x == self.w - 1)
+        y_min = (y == 0)
+        y_max = (y == self.h - 1)
+        z_min = (z == 0)
+        z_max = (z == self.d - 1)
+
+        key = (x_min, x_max, y_min, y_max, z_min, z_max)
+        neighbours = self.neighbours_dict[key]
+
+        return neighbours
+
+
     def get_linear_system(self):
 
         A = np.zeros((self.volume.size, self.volume.size), dtype = np.float32)
         b = np.zeros(self.volume.size, dtype = np.float32)
 
         i = 0
-        w, h, d = self.volume.shape
-        neighbour_displacement_template = np.array((h*d, d, 1), dtype=int)
+        
+        neighbour_displacement_template = np.array(
+            (self.h*self.d, self.d, 1), 
+            dtype=int,
+            )
 
-        for x, y, z in ((a, b, c) for a in range(w) for b in range(h) for c in range(d)):
+        for x, y, z in ((a, b, c) 
+                        for a in range(self.w) 
+                        for b in range(self.h) 
+                        for c in range(self.d)
+            ):
             coords = np.array((x, y, z))
             center_c = self.volume[tuple(coords)]
 
@@ -140,17 +178,12 @@ class VolumeManager():
                 i += 1
                 continue
 
-            x_min = (x == 0)
-            x_max = (x == w - 1)
-            y_min = (y == 0)
-            y_max = (y == h - 1)
-            z_min = (z == 0)
-            z_max = (z == d - 1)
-
-            key = (x_min, x_max, y_min, y_max, z_min, z_max)
-            neighbours = self.neighbours_dict[key]
+            neighbours = self.get_neighbours(x, y, z)
 
             total_c = np.float32(0)
+
+            z_min = (z == 0)
+            z_max = (z == self.d - 1)
 
             if z_min:
                 total_c += 2 * center_c
@@ -345,13 +378,10 @@ class VolumeManager():
             for y in range(h):
                 for z in range(d):
                     center_element = boundary_volume[x, y, z]
-                    if center_element == PORE:
-                        nulls_count[i] = running_zeros
-                        i += 1
-                    else:
+                    if center_element != PORE:
                         running_zeros += 1
-                        nulls_count[i] = running_zeros
-                        i += 1
+                    nulls_count[i] = running_zeros
+                    i += 1
 
     
     def ravel_dense_solution(self, solution):
@@ -541,26 +571,17 @@ def _jit_sparse_system_extraction(
                     if boundary_volume[x, y, z] != PORE:
                         continue
 
-                x_min = (x == 0)
-                x_max = (x == w - 1)
-                y_min = (y == 0)
-                y_max = (y == h - 1)
-                z_min = (z == 0)
-                z_max = (z == d - 1)
-
-                x_index = 1 - x_min*1 + x_max*1
-                y_index = 1 - y_min*1 + y_max*1
-                z_index = 1 - z_min*1 + z_max*1
-
-                neighbours = _get_neighbours(x_index, y_index, z_index)
+                neighbours = _get_neighbours(x, y, z, conductivity_volume)
 
                 total_c = np.float32(0)
 
+                z_is_min = (z == 0)
+                z_is_max = (z == d - 1)
                 if not irregular_boundary:
-                    if z_min:
+                    if z_is_min:
                         total_c += 2 * center_c
                         condensed_b[_unravel(x, y, z, h, d, nulls_count)] = -(2 * center_c)
-                    elif z_max:
+                    elif z_is_max:
                         total_c += 2 * center_c
 
                 center_i = _unravel(x, y, z, h, d, nulls_count)
@@ -628,7 +649,25 @@ def _unravel(x, y, z, h, d, nulls_count):
 
 
 @njit
-def _get_neighbours(x, y, z):
+def _get_neighbours(x, y, z, volume):
+
+    w, h, d = volume.shape
+    x_min = (x == 0)
+    x_max = (x == w - 1)
+    y_min = (y == 0)
+    y_max = (y == h - 1)
+    z_min = (z == 0)
+    z_max = (z == d - 1)
+
+    x_index = 1 - x_min*1 + x_max*1
+    y_index = 1 - y_min*1 + y_max*1
+    z_index = 1 - z_min*1 + z_max*1
+
+    return _get_neighbours_dict(x_index, y_index, z_index)
+
+
+@njit
+def _get_neighbours_dict(x, y, z):
     #x_max, y_max, z_max
     if (x == 0) and(y == 0) and(z == 0):
         return list( ((1, 0, 0), (0, 1, 0), (0, 0, 1)) )
