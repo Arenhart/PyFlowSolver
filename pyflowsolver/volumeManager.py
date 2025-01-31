@@ -613,7 +613,7 @@ def _jit_sparse_system_extraction(
                         total_c += np.float32(face_c)
                         #center element is always PORE
                         if neighbour_element == INLET:
-                            condensed_b[_unravel(x, y, z, h, d, nulls_count)] = -face_c
+                            condensed_b[_unravel(x, y, z, h, d, nulls_count)] -= face_c
 
                 val_array[vals_n] = -total_c
                 col_idx_array[vals_n] = _unravel(x, y, z, h, d, nulls_count)
