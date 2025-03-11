@@ -204,7 +204,7 @@ class NetworkManager():
                         raise Exception
 
         # sparse cleanup
-        nulls_counter = 0
+        cumulative_nulls = 0
         for i in range(sparse_row_ptr.size):
             row_ptr_start = sparse_row_ptr[i]
             if (i + 1) < sparse_row_ptr.size:
@@ -216,15 +216,16 @@ class NetworkManager():
             sort_index = np.argsort(sparse_col_idx[row_ptr_start:row_ptr_stop])
             sorted_vals = sparse_val[row_ptr_start:row_ptr_stop][sort_index]
             sorted_col_idx = sparse_col_idx[row_ptr_start:row_ptr_stop][sort_index]
-            compacted_start = row_ptr_start - nulls_counter
+            compacted_start = row_ptr_start - cumulative_nulls
             compacted_end = compacted_start + filled
             sparse_val[compacted_start:compacted_end] = sorted_vals[nulls:]
             sparse_col_idx[compacted_start:compacted_end] = sorted_col_idx[nulls:]
-            nulls_counter += nulls
-            sparse_row_ptr[i] -= nulls_counter
-        if nulls > 0:
-            sparse_val = sparse_val[:-nulls_counter]
-            sparse_col_idx = sparse_col_idx[:-nulls_counter]
+            if i >= 1:
+                sparse_row_ptr[i] = compacted_start
+            cumulative_nulls += nulls
+        if cumulative_nulls > 0:
+            sparse_val = sparse_val[: sparse_val.size - cumulative_nulls]
+            sparse_col_idx = sparse_col_idx[: sparse_col_idx.size - cumulative_nulls]
 
         return sparse_val, sparse_col_idx, sparse_row_ptr, b, mid_to_total_indexes
 
