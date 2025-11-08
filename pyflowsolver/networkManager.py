@@ -55,13 +55,13 @@ class NetworkManager():
             return self.a_sparse_array, self.b_array
 
 
-    def get_pressure_list(self, x):
+    def get_pressure_list(self, x, pressure_drop=101325.):
 
         pressure = np.zeros(self.inlets.size, dtype=np.float64)
-        pressure[self.mid_to_total_indexes] = x * np.float64(101325)
+        pressure[self.mid_to_total_indexes] = x * np.float64(pressure_drop)
         for i in range(self.inlets.size):
             if self.inlets[i] == 1:
-                pressure[i] = np.float64(101325)
+                pressure[i] = np.float64(pressure_drop)
             elif self.outlets[i] == 1:
                 pressure[i] = np.float64(0)
         return pressure
