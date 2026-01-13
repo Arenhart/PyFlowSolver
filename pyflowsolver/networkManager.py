@@ -58,59 +58,38 @@ class NetworkManager():
     def get_pressure_list(self, x, pressure_drop=101325.):
 
         pressure = np.zeros(self.inlets.size, dtype=np.float64)
-        pressure[self.mid_to_total_indexes] = x * np.float64(pressure_drop)
-        for i in range(self.inlets.size):
-            if self.inlets[i] == 1:
-                pressure[i] = np.float64(pressure_drop)
-            elif self.outlets[i] == 1:
-                pressure[i] = np.float64(0)
+        pressure = self._get_pressure_list(
+            pressure, 
+            x, 
+            pressure_drop, 
+            self.mid_to_total_indexes, 
+            self.inlets, 
+            self.outlets,
+            )
         return pressure
-
+    
 
     def get_flow_rate(self, pressures):
-        inlet_flow_total = np.float64(0.0)
-        outlet_flow_total = np.float64(0.0)
-        border_pore = np.logical_or(self.inlets, self.outlets)
         throats_n = self.cond.size
 
         flow = np.zeros(throats_n, dtype=np.float64)
         delta_p = np.zeros(throats_n, dtype=np.float64)
         inlet_flow = np.zeros(throats_n, dtype=np.float64)
         outlet_flow = np.zeros(throats_n, dtype=np.float64)
-        for throat in range(throats_n):
-            p0 = self.conn[throat, 0]
-            p1 = self.conn[throat, 1]
-            c = self.cond[throat]
-            delta_p[throat] = np.abs(p0 - p1)
-            flow[throat] = delta_p[throat] * c
 
-        border_pore = np.logical_or(self.inlets, self.outlets)
-        for throat in range(throats_n):
-            p0 = self.conn[throat, 0]
-            p1 = self.conn[throat, 1]
-            c = self.cond[throat]
-            if self.inlets[p0] and (not border_pore[p1]):
-                inlet_flow_total += c * (
-                    np.float64(101325.0) - pressures[p1]
-                )
-                inlet_flow[throat] = c * (
-                    np.float64(101325.0) - pressures[p1]
-                )
-            if self.inlets[p1] and (not border_pore[p0]):
-                inlet_flow_total += c * (
-                    np.float64(101325.0) - pressures[p0]
-                )
-                inlet_flow[throat] = c * (
-                    np.float64(101325.0) - pressures[p0]
-                )
-            if self.outlets[p0] and (not border_pore[p1]):
-                outlet_flow_total += c * (pressures[p1])
-                outlet_flow[throat] = c * (pressures[p1])
-            if self.outlets[p1] and (not border_pore[p0]):
-                outlet_flow_total += c * (pressures[p0])
-                outlet_flow[throat] = c * (pressures[p0])
+        flow_rate = self._compute_flow(
+            self.conn, 
+            self.cond, 
+            flow, 
+            delta_p, 
+            throats_n, 
+            pressures, 
+            self.inlets, 
+            self.outlets,
+            inlet_flow,
+            outlet_flow,
+            )
 
-        flow_rate = (outlet_flow_total + inlet_flow_total) / 2
         return flow_rate
 
 
@@ -130,6 +109,7 @@ class NetworkManager():
         n_p_mid = n_p_total - n_p_in - n_p_out
         n_t = cond.size
 
+        # indexes to convert mid pores list to totalpore list
         mid_to_total_indexes = np.zeros((n_p_mid), dtype=np.int32)
         total_to_mid_indexes = np.zeros((n_p_total), dtype=np.int32)
 
@@ -228,3 +208,77 @@ class NetworkManager():
 
         return sparse_val, sparse_col_idx, sparse_row_ptr, b, mid_to_total_indexes
 
+    @staticmethod
+    @njit
+    def _compute_flow(
+        conn, 
+        cond, 
+        flow, 
+        delta_p, 
+        throats_n, 
+        pressures, 
+        inlets, 
+        outlets, 
+        inlet_flow, 
+        outlet_flow
+        ):
+
+        inlet_flow_total = np.float64(0.0)
+        outlet_flow_total = np.float64(0.0)
+
+        for throat in range(throats_n):
+            p0 = conn[throat, 0]
+            p1 = conn[throat, 1]
+            c = cond[throat]
+            delta_p[throat] = np.abs(p0 - p1)
+            flow[throat] = delta_p[throat] * c
+
+        border_pore = np.logical_or(inlets, outlets)
+        for throat in range(throats_n):
+            p0 = conn[throat, 0]
+            p1 = conn[throat, 1]
+            c = cond[throat]
+            if inlets[p0] and (not border_pore[p1]):
+                inlet_flow_total += c * (
+                    np.float64(101325.0) - pressures[p1]
+                )
+                inlet_flow[throat] = c * (
+                    np.float64(101325.0) - pressures[p1]
+                )
+            if inlets[p1] and (not border_pore[p0]):
+                inlet_flow_total += c * (
+                    np.float64(101325.0) - pressures[p0]
+                )
+                inlet_flow[throat] = c * (
+                    np.float64(101325.0) - pressures[p0]
+                )
+            if outlets[p0] and (not border_pore[p1]):
+                outlet_flow_total += c * (pressures[p1])
+                outlet_flow[throat] = c * (pressures[p1])
+            if outlets[p1] and (not border_pore[p0]):
+                outlet_flow_total += c * (pressures[p0])
+                outlet_flow[throat] = c * (pressures[p0])
+
+        flow_rate = (outlet_flow_total + inlet_flow_total) / 2
+        return flow_rate
+    
+    @staticmethod
+    @njit
+    def _get_pressure_list(
+            pressure, 
+            x, 
+            pressure_drop, 
+            mid_to_total_indexes, 
+            inlets, 
+            outlets,
+            ):
+        pressure_drop = np.float64(pressure_drop)
+        for mid_index in range(mid_to_total_indexes.size):
+            total_index = mid_to_total_indexes[mid_index]
+            pressure[total_index] = x[mid_index] * pressure_drop
+        for i in range(inlets.size):
+            if inlets[i] == 1:
+                pressure[i] = pressure_drop
+            elif outlets[i] == 1:
+                pressure[i] = np.float64(0)
+        return pressure
