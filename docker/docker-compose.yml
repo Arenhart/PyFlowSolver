@@ -1,6 +1,8 @@
 services:
   master:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     hostname: master
     container_name: master
     environment:
@@ -13,7 +15,9 @@ services:
     tty: true
 
   worker1:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     hostname: worker1
     container_name: worker1
     environment:
@@ -26,7 +30,9 @@ services:
       - master
 
   worker2:
-    build: .
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
     hostname: worker2
     container_name: worker2
     environment:
