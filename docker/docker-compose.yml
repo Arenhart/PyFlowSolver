@@ -1,0 +1,49 @@
+services:
+  master:
+    build: .
+    hostname: master
+    container_name: master
+    environment:
+      - SLURM_ROLE=master
+    networks:
+      slurm-net:
+        ipv4_address: 192.168.100.10
+    volumes:
+      - slurm-state:/var/spool/slurm
+    tty: true
+
+  worker1:
+    build: .
+    hostname: worker1
+    container_name: worker1
+    environment:
+      - SLURM_ROLE=worker
+      - SLURM_NODENAME=worker1
+    networks:
+      slurm-net:
+        ipv4_address: 192.168.100.11
+    depends_on:
+      - master
+
+  worker2:
+    build: .
+    hostname: worker2
+    container_name: worker2
+    environment:
+      - SLURM_ROLE=worker
+      - SLURM_NODENAME=worker2
+    networks:
+      slurm-net:
+        ipv4_address: 192.168.100.12
+    depends_on:
+      - master
+
+networks:
+  slurm-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 192.168.100.0/24
+
+volumes:
+  slurm-state:
