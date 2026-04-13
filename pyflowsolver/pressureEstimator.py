@@ -41,16 +41,24 @@ def segment_pore_space(pore_volume, subsegment_size = 20):
 def create_pseudo_network(segmented_volume, conductivity_volume, scale):
     """Build a NetworkManager-compatible pore network from segmented regions.
 
-    Each segment becomes a pore. Two pores are connected (by a throat) if
-    their segments share a face-adjacent voxel boundary. The throat
-    conductance is geometric mean of the pore voxels conductivity
-    multiplied by the total voxel volume (considering both touching segments)
-     and divided by the square of the distance between segment centroids.
+    Each segment becomes a single lumped pore (uniform pressure). A throat
+    between two segments is assembled as the parallel sum of per-voxel-face
+    conductances over every shared face-adjacency between the two segments:
 
-    Inlets and outlets are added as new pores connected to segments that touch
-    the volume boundary in z = 0 (inlet) and z = segmented_volume.shape[2] (outlet).
-    Their conductivities are calculated similarly to other throats, but using the
-    the distance from the segment centroid to the volume boundary.
+        G_face = 2 · (A_face / L_axis) / (1/c1 + 1/c2)
+        G_throat = sum_{shared faces} G_face
+
+    This matches ``volumeManager``'s per-face formula exactly at the
+    single-face limit (``face_c = 2/(1/c1 + 1/c2)``) and treats each shared
+    voxel-face as an independent micro-throat in parallel. Because the pore-
+    network model assumes uniform pressure inside each segment, segment-body
+    resistance contributes zero; all resistance lives at the throat faces,
+    which is precisely what this parallel sum captures.
+
+    Inlets and outlets are virtual pores with Dirichlet pressure (1 at z=0,
+    0 at z=d-1). Each boundary-touching voxel contributes a face conductance
+    ``G_face = 2 · c · A_face / L_axis`` (again, volumeManager's boundary
+    convention).
 
     Parameters
     ----------
@@ -75,7 +83,11 @@ def create_pseudo_network(segmented_volume, conductivity_volume, scale):
     """
     w, h, d = segmented_volume.shape
     dx, dy, dz = float(scale[0]), float(scale[1]), float(scale[2])
-    voxel_volume = dx * dy * dz
+
+    # A_face / L_axis per normal-axis (x, y, z). This is the geometric factor
+    # that turns a harmonic-mean conductivity into a conductance for a single
+    # voxel-face of the corresponding orientation.
+    face_A_over_L = (dy * dz / dx, dx * dz / dy, dx * dy / dz)
 
     n_segments = int(segmented_volume.max())
 
@@ -84,109 +96,65 @@ def create_pseudo_network(segmented_volume, conductivity_volume, scale):
     outlet_idx = n_segments + 1
     n_pores = n_segments + 2
 
-    # --- Per-segment stats in a single pass ---
-    centroids = np.zeros((n_segments, 3), dtype=np.float64)
-    counts = np.zeros(n_segments, dtype=np.int64)
-    log_cond_prods = np.zeros(n_segments, dtype=np.float64)
-    cond_inverse_sums = np.zeros(n_segments, dtype=np.float64)
-    touches_inlet = np.zeros(n_segments, dtype=bool)
-    touches_outlet = np.zeros(n_segments, dtype=bool)
+    # --- Accumulate throat conductance per (idx_lo, idx_hi) pair (N-fix1 + N-fix2)
+    throat_cond = {}  # (idx_lo, idx_hi) -> G accumulated over shared faces
+    inlet_cond = np.zeros(n_segments, dtype=np.float64)
+    outlet_cond = np.zeros(n_segments, dtype=np.float64)
 
-    for x in range(w):
-        for y in range(h):
-            for z in range(d):
-                lbl = segmented_volume[x, y, z]
-                if lbl <= 0:
-                    continue
-                idx = lbl - 1
-                centroids[idx, 0] += x * dx
-                centroids[idx, 1] += y * dy
-                centroids[idx, 2] += (z + 0.5) * dz
-                counts[idx] += 1
+    face_directions = ((1, 0, 0, 0), (0, 1, 0, 1), (0, 0, 1, 2))
 
-                c = conductivity_volume[x, y, z]
-                if c > 0:
-                    log_cond_prods[idx] += np.log(c)
-                    cond_inverse_sums[idx] += 1.0 / c
-
-                if z == 0:
-                    touches_inlet[idx] = True
-                if z == d - 1:
-                    touches_outlet[idx] = True
-
-    nonzero = counts > 0
-    centroids[nonzero] /= counts[nonzero, np.newaxis]
-
-    # Geometric mean of conductivity per segment (for inlet/outlet throats)
-    geom_mean_per_seg = np.zeros(n_segments, dtype=np.float64)
-    geom_mean_per_seg[nonzero] = np.exp(log_cond_prods[nonzero] / counts[nonzero])
-
-    # --- Find face-adjacent inter-segment connections ---
-    throat_pairs = set()
-    face_directions = [(1, 0, 0), (0, 1, 0), (0, 0, 1)]
-
-    for di, dj, dk in face_directions:
+    for di, dj, dk, axis in face_directions:
+        ratio = face_A_over_L[axis]
         for x in range(w - di):
             for y in range(h - dj):
                 for z in range(d - dk):
                     lbl1 = segmented_volume[x, y, z]
                     lbl2 = segmented_volume[x + di, y + dj, z + dk]
-
                     if lbl1 <= 0 or lbl2 <= 0 or lbl1 == lbl2:
                         continue
+                    c1 = conductivity_volume[x, y, z]
+                    c2 = conductivity_volume[x + di, y + dj, z + dk]
+                    if c1 <= 0 or c2 <= 0:
+                        continue
+                    g_face = 2.0 * ratio / (1.0 / c1 + 1.0 / c2)
+                    idx_lo = min(lbl1, lbl2) - 1
+                    idx_hi = max(lbl1, lbl2) - 1
+                    key = (idx_lo, idx_hi)
+                    throat_cond[key] = throat_cond.get(key, 0.0) + g_face
 
-                    idx1 = lbl1 - 1
-                    idx2 = lbl2 - 1
-                    throat_pairs.add((min(idx1, idx2), max(idx1, idx2)))
+    # Inlet / outlet: each boundary-touching voxel face contributes G_face = 2c · A/L
+    # (volumeManager's Dirichlet convention: ghost pressure acts directly at the face).
+    z_ratio = face_A_over_L[2]
+    for x in range(w):
+        for y in range(h):
+            lbl = segmented_volume[x, y, 0]
+            if lbl > 0:
+                c = conductivity_volume[x, y, 0]
+                if c > 0:
+                    inlet_cond[lbl - 1] += 2.0 * c * z_ratio
+            lbl = segmented_volume[x, y, d - 1]
+            if lbl > 0:
+                c = conductivity_volume[x, y, d - 1]
+                if c > 0:
+                    outlet_cond[lbl - 1] += 2.0 * c * z_ratio
 
-    # --- Build throats ---
+    # --- Pack into conn / cond arrays ---
     conn_list = []
     cond_list = []
 
-    # Inter-segment throats
-    for idx1, idx2 in throat_pairs:
-        total_count = counts[idx1] + counts[idx2]
-        if total_count <= 0:
-            continue
-        combined_log_sum = log_cond_prods[idx1] + log_cond_prods[idx2]
-        geom_mean = np.exp(combined_log_sum / total_count)
-        harmonic_mean = total_count / (cond_inverse_sums[idx1] + cond_inverse_sums[idx2])
-        total_vol = total_count * voxel_volume
-        dist = np.linalg.norm(centroids[idx1] - centroids[idx2])
-        if dist > 0 and geom_mean > 0:
+    for (idx1, idx2), g in throat_cond.items():
+        if g > 0:
             conn_list.append((idx1, idx2))
-            cond_list.append(geom_mean * total_vol / (2 * dist ** 2))
+            cond_list.append(g)
 
-    # Inlet throats: segments touching z=0 connect to the virtual inlet pore
     for idx in range(n_segments):
-        if not touches_inlet[idx] or counts[idx] <= 0:
-            continue
-        gm = geom_mean_per_seg[idx]
-        if gm <= 0:
-            continue
-        total_vol = counts[idx] * voxel_volume
-        dist = centroids[idx, 2]  # physical distance from centroid to z=0
-        if dist <= 0:
-            dist = dz / 2.0
-        conn_list.append((idx, inlet_idx))
-        cond_list.append(gm * total_vol / (dist ** 2))
+        if inlet_cond[idx] > 0:
+            conn_list.append((idx, inlet_idx))
+            cond_list.append(inlet_cond[idx])
+        if outlet_cond[idx] > 0:
+            conn_list.append((idx, outlet_idx))
+            cond_list.append(outlet_cond[idx])
 
-    # Outlet throats: segments touching z=d-1 connect to the virtual outlet pore
-    z_max_phys = (d - 1) * dz
-    for idx in range(n_segments):
-        if not touches_outlet[idx] or counts[idx] <= 0:
-            continue
-        gm = geom_mean_per_seg[idx]
-        if gm <= 0:
-            continue
-        total_vol = counts[idx] * voxel_volume
-        dist = z_max_phys - centroids[idx, 2]
-        if dist <= 0:
-            dist = dz / 2.0
-        conn_list.append((idx, outlet_idx))
-        cond_list.append(gm * total_vol / (dist ** 2))
-
-    # --- Pack into arrays ---
     n_throats = len(conn_list)
     if n_throats > 0:
         conn = np.array(conn_list, dtype=np.int32)
