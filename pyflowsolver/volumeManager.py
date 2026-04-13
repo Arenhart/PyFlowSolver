@@ -63,9 +63,8 @@ class VolumeManager():
 
     def convert_pore_volume_to_laplacian_conductivity(self, porosity_map=False):
         if not porosity_map:
-            self.volume = (self.boundary_volume >= 1)*100
             self.volume = fast_laplacian_volume_generator(
-                self.volume, 
+                (self.volume >= 1)*100, 
                 self.scale,
                 closed_border=False, 
                 )
@@ -395,7 +394,7 @@ class VolumeManager():
         return raveled_solution
     
     def ravel_sparse_solution(self, solution):
-        raveled_solution = np.zeros_like(self.volume)
+        raveled_solution = np.zeros_like(self.volume, dtype=np.float32)
         w, h, d = raveled_solution.shape
         i = 0
         for x, y, z in ((a,b,c) for a in range(w) for b in range(h) for c in range(d)):

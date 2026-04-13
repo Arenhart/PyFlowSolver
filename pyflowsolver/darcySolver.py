@@ -29,10 +29,10 @@ class DarcySolver(Solver):
 
         for key, value in params.items():
             if key in self.DEFAULT_PARAMS.keys():
-                self.default_params[key] = value
+                self.params[key] = value
             else:
                 raise Exception(f"{key} is not a valid parameter,"
-                                f"parameters are {list(self.default_params.keys())}")
+                                f"parameters are {list(self.params.keys())}")
         
         
     def set_linear_system(self, a_sparse_array, b_array):
@@ -157,7 +157,8 @@ class DarcySolver(Solver):
         #Reference: https://repository.lsu.edu/cgi/viewcontent.cgi?article=1254&context=honors_etd
 
         x = X0.copy()
-        r = b.copy()
+        r = np.empty_like(b)
+        _recalc_residuals_jit(r, A_val, A_col_idx, A_row_ptr, b, x)
         m = np.empty(1, dtype=np.float64)
         m[0] = _square_sum_vector(r, threads) # f(x:vector) = x'*x
         m_last = np.empty(1, dtype=np.float64)
@@ -211,7 +212,8 @@ class DarcySolver(Solver):
         # Reference: https://repository.lsu.edu/cgi/viewcontent.cgi?article=1254&context=honors_etd
 
         x = X0.copy()
-        r = b.copy()
+        r = np.empty_like(b)
+        _recalc_residuals_jit(r, A_val, A_col_idx, A_row_ptr, b, x)
         m = np.empty(1, dtype=np.float64)
         m[0] = _scalar_product(
             r,
