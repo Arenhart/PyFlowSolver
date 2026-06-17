@@ -9,9 +9,9 @@ setuptools.setup(
     url='https://github.com/yourusername/your_project',
     install_requires=[
         "pytest>=7.4.4",
-        "numpy>=1.23.1",
-        "numba>=0.56.2",
+        "numpy==1.26.4",
+        "numba==0.60.0",
         "porespy>=2.3.0",
-        "pyedt>=0.1.4"
+        "pyedt==0.1.5"
     ],
     )
