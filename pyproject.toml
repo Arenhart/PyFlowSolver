@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools==80.10.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyflowsolver"
+version = "0.1"
+description = "Flow solver"
+authors = [
+    { name = "LTrace technologies" }
+]
+dependencies = [
+    "pytest>=7.4.4",
+    "numpy==1.26.4",
+    "numba==0.60.0",
+    "porespy>=2.3.0",
+    "pyedt==0.1.5"
+]
+
+[project.urls]
+Homepage = "https://github.com/ltracegeo/PyFlowSolver"
+
+[tool.setuptools]
+packages = ["pyflowsolver"]
+
+[tool.pytest.ini_options]
+testpaths = [
+    "tests/unit",
+]
+env = [
+    "QT_QPA_PLATFORM = offscreen"
+]
+filterwarnings = [
+    "ignore:Type PySide2\\..* uses PyType_Spec with a metaclass that has custom tp_new:DeprecationWarning",
+    "ignore:The hookimpl CovPlugin\\..* uses old-style configuration options:pytest.PytestDeprecationWarning",
+]
