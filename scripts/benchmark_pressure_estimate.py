@@ -18,10 +18,13 @@ from pyflowsolver.volumeManager import VolumeManager
 from pyflowsolver.darcySolver import DarcySolver
 from pyflowsolver.pressureEstimator import estimate_pressure_distribution
 
-SIZE = 100
+SIZE = 200
 SEGMENT = 2
 SIGMA = 2
 RADIUS = 5
+
+TARGET_TOL = 1e-7
+MAX_ITER = 10000
 
 # ---------------------------------------------------------------------------
 # 0. Generate volume and build sparse system
@@ -47,7 +50,7 @@ volume_manager.convert_pore_volume_to_laplacian_conductivity()
 sparse_A, dense_b = volume_manager.get_sparse_system_jit()
 
 print("\n--- Warming up JIT ---")
-solver = DarcySolver(target_error=1e-8)
+solver = DarcySolver(target_error=TARGET_TOL, max_iterations=MAX_ITER)
 print()
 solver.set_linear_system(sparse_A, dense_b)
 solver.generate_preconditioner(preconditioner="inverse_diagonal")
@@ -96,7 +99,7 @@ print(f"  System size N={dense_b.size}, nnz={sparse_A['val'].size}")
 # 2. Solve with X0 = zeros
 # ---------------------------------------------------------------------------
 print("\n--- Solve with X0 = zeros ---")
-solver = DarcySolver(target_error=1e-8)
+solver = DarcySolver(target_error=TARGET_TOL, max_iterations=MAX_ITER)
 print()
 solver.set_linear_system(sparse_A, dense_b)
 solver.generate_preconditioner(preconditioner="inverse_diagonal")
@@ -157,7 +160,7 @@ for x in range(w):
 # ---------------------------------------------------------------------------
 print("\n--- Solve with X0 = pressure estimate ---")
 
-solver = DarcySolver()
+solver = DarcySolver(target_error=TARGET_TOL, max_iterations=MAX_ITER)
 print()
 sparse_A, dense_b = volume_manager.get_sparse_system_jit()
 solver.set_linear_system(sparse_A, dense_b)

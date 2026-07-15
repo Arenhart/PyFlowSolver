@@ -98,8 +98,10 @@ class DarcySolver(Solver):
         return self.x, self.error, self.iteration
 
 
-    def solve_pcg(self):
+    def solve_pcg(self, X0=None):
 
+        if X0 is None:
+            X0 = np.zeros_like(self.b_array)
         self.x, self.error, self.iteration = self._solve_pcg(
             A_val=self.a_sparse_array["val"],
             A_col_idx=self.a_sparse_array["col_idx"],
@@ -110,7 +112,7 @@ class DarcySolver(Solver):
             b=self.b_array,
             max_iterations=self.params["max_iterations"], # sqrt(V)
             target_error=self.params["target_error"], # 1.0e-6
-            X0=np.zeros_like(self.b_array),
+            X0=X0,
             threads=1
         )
         return self.x, self.error, self.iteration
@@ -453,3 +455,45 @@ def _multiply_array_and_add(
     )
     new_p += x * u
     return new_p
+
+
+@njit(parallel=True)
+def _jacobi_sweeps(A_val, A_col_idx, A_row_ptr, b, x_init, k_sweeps):
+    """Run k plain Jacobi relaxation sweeps on A x = b starting from x_init.
+
+    x_new[i] = (b[i] - sum_{j != i} A[i,j] * x[j]) / A[i,i]
+
+    CSR convention matches the rest of this module: A_row_ptr has N entries
+    (not N+1); row i spans A_row_ptr[i] .. A_row_ptr[i+1] (or A_val.size for
+    the last row). Rows with zero diagonal are left unchanged.
+
+    Returns a fresh array; does not mutate x_init.
+    """
+    n = x_init.shape[0]
+    x = x_init.copy()
+    x_new = np.empty_like(x)
+    for _sweep in range(k_sweeps):
+        for row in prange(n):
+            start = A_row_ptr[row]
+            if row + 1 < n:
+                stop = A_row_ptr[row + 1]
+            else:
+                stop = A_val.size
+            diag = 0.0
+            off = 0.0
+            for linear_index in range(start, stop):
+                col = A_col_idx[linear_index]
+                v = A_val[linear_index]
+                if col == row:
+                    diag = v
+                else:
+                    off += v * x[col]
+            if diag != 0.0:
+                x_new[row] = (b[row] - off) / diag
+            else:
+                x_new[row] = x[row]
+        # Ping-pong buffers: x now holds the freshly computed sweep.
+        tmp = x
+        x = x_new
+        x_new = tmp
+    return x

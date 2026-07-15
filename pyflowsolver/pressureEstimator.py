@@ -315,17 +315,23 @@ def create_pressure_volume(segmented_volume, segment_pressures, scale, radius, s
 
 
 def estimate_pressure_distribution(
-        pore_volume, 
-        conductivity_volume, 
-        scale, 
+        pore_volume,
+        conductivity_volume,
+        scale,
         subsegment_size=20,
         sigma=2,
         radius=5,
+        k_jacobi=0,
         ):
     """Convenience function: run all three steps to get a pressure estimate volume.
 
     Segments the pore space, builds and solves a pseudo-network, and maps
-    pressures back to the 3D volume.
+    pressures back to the 3D volume. Optionally runs a fixed number of
+    Jacobi relaxation sweeps on the full Darcy sparse system using the
+    pseudo-network estimate as the initial guess — a very cheap "high-
+    frequency smoother" that significantly sharpens the estimate because
+    the pseudo-network supplies good low-frequency modes but leaves
+    high-frequency residuals that a handful of Jacobi sweeps quickly kill.
 
     Parameters
     ----------
@@ -335,6 +341,12 @@ def estimate_pressure_distribution(
         float 3D array of per-voxel conductivities.
     scale : tuple of float
         Voxel dimensions (dx, dy, dz).
+    subsegment_size, sigma, radius : see ``segment_pore_space`` /
+        ``create_pressure_volume``.
+    k_jacobi : int, optional
+        Number of Jacobi relaxation sweeps on the full sparse Darcy system,
+        applied after ``create_pressure_volume``. 0 (the default) skips
+        this step entirely and returns the pseudo-network estimate as-is.
 
     Returns
     -------
@@ -347,10 +359,59 @@ def estimate_pressure_distribution(
     )
     segment_pressures = solve_pseudo_network(conn, cond, inlets, outlets)
     pressure_volume = create_pressure_volume(
-        segmented_volume, 
-        segment_pressures, 
+        segmented_volume,
+        segment_pressures,
         scale,
         sigma=sigma,
         radius=radius,
     )
+    if k_jacobi > 0:
+        pressure_volume = _smooth_with_jacobi(
+            pressure_volume, conductivity_volume, scale, k_jacobi,
+        )
     return pressure_volume
+
+
+def _smooth_with_jacobi(pressure_volume, conductivity_volume, scale, k_sweeps):
+    """Run ``k_sweeps`` Jacobi relaxations on the full Darcy system.
+
+    Assembles the full sparse system via ``VolumeManager``, condenses the
+    3D pressure estimate into sparse-index ordering as the initial guess,
+    calls ``_jacobi_sweeps``, and un-condenses the result back into a 3D
+    volume with the same shape as the input.
+
+    ``VolumeManager`` mutates its ``volume`` argument in place during
+    ``filter_connected_volume``, so a copy of ``conductivity_volume`` is
+    passed in to protect the caller's array.
+    """
+    from pyflowsolver.volumeManager import VolumeManager
+    from pyflowsolver.darcySolver import _jacobi_sweeps
+
+    vm = VolumeManager(np.array(conductivity_volume, copy=True), scale=scale)
+    sparse_A, b = vm.get_sparse_system_jit()
+
+    # Condense 3D estimate to 1D sparse-index vector, iterating in the same
+    # (x, y, z) order that VolumeManager uses internally.
+    x0 = np.zeros(b.size, dtype=np.float64)
+    w, h, d = vm.volume.shape
+    i = 0
+    for x in range(w):
+        for y in range(h):
+            for z in range(d):
+                if vm.volume[x, y, z] > 0:
+                    x0[i] = pressure_volume[x, y, z]
+                    i += 1
+
+    x_smoothed = _jacobi_sweeps(
+        sparse_A["val"],
+        sparse_A["col_idx"],
+        sparse_A["row_ptr"],
+        b,
+        x0,
+        int(k_sweeps),
+    )
+
+    # Un-condense back to 3D. ravel_sparse_solution fills solid voxels with 0,
+    # which matches the input convention.
+    smoothed_volume = np.asarray(vm.ravel_sparse_solution(x_smoothed))
+    return smoothed_volume.astype(pressure_volume.dtype, copy=False)
