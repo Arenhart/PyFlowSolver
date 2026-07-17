@@ -23,12 +23,32 @@ from numba import njit, prange
 from pyflowsolver.solver import Solver
 from pyflowsolver.volumeManager import VolumeManager
 from pyflowsolver.darcySolver import DarcySolver
+from pyflowsolver.multigridSolver import MultigridSolver
 from pyflowsolver.constants import SOLID, PORE, INLET, OUTLET
 
 
 class StokesSolver(Solver):
     # Stopping criteria for the projection iteration (see `_velocity_residual`).
     CONVERGENCE_CRITERIA = ("step", "residual")
+    # Backend for the per-iteration pressure-Poisson solve:
+    #   "pcg"   -> DarcySolver diagonal-preconditioned CG (baseline)
+    #   "mgpcg" -> MultigridSolver algebraic-multigrid PCG (size-independent
+    #              iteration count; the big win on large / low-porosity volumes)
+    POISSON_BACKENDS = ("pcg", "mgpcg")
+    # Viscous predictor discretization:
+    #   "explicit" -> forward-Euler diffusion, dt viscous-limited (baseline)
+    #   "implicit" -> backward-Euler diffusion (I - dt*nu*L)u* = u^n + dt*f,
+    #                 solved per component with multigrid. Unconditionally
+    #                 stable, so dt is not viscous-capped -> far fewer, larger
+    #                 pseudo-time steps to steady state (Phase 2, stokes_solver.md
+    #                 s10.4 Option A). The implicit pseudo-transient is size-
+    #                 independent (~25 steps) on channel-like geometry but can
+    #                 stall short of steady state on complex pore media, so once
+    #                 it settles the driver hands off to the explicit predictor
+    #                 to verify/finish (see `solve`); `fell_back` reports whether
+    #                 that finish had to do real work. Regular (z-driven) volumes
+    #                 only -- irregular boundaries raise NotImplementedError.
+    PREDICTORS = ("explicit", "implicit")
 
     DEFAULT_PARAMS = {
         "viscosity": 1.0,          # kinematic viscosity nu = mu / rho
@@ -43,6 +63,18 @@ class StokesSolver(Solver):
         #                 residual max|R| / max|u|, which is independent of the
         #                 pseudo-time step (a property of the field, not of dt).
         "convergence_criterion": "step",
+        # Pressure-Poisson linear-solve backend (see POISSON_BACKENDS).
+        "poisson_backend": "pcg",
+        # Viscous predictor discretization (see PREDICTORS).
+        "predictor": "explicit",
+        # Pseudo-dt for the implicit predictor: dt = implicit_dt_factor *
+        # min(dx_i^2) / nu. Unbounded by stability. Convergence is fastest in the
+        # large-dt (Uzawa) limit, where the predictor reduces to a steady
+        # diffusion solve given p and the outer loop becomes a size-independent
+        # ~20-iteration Schur iteration; the count saturates once dt exceeds the
+        # domain diffusion time (~ (L/dx)^2), so the default is deliberately large
+        # (overshooting is free -- incremental correction keeps it accurate).
+        "implicit_dt_factor": 1.0e6,
     }
 
     def __init__(self, volume_manager, initial_pressure=None,
@@ -87,6 +119,14 @@ class StokesSolver(Solver):
         # Cached pressure-Poisson DarcySolver (matrix + preconditioner)
         self.poisson_solver = None
 
+        # Implicit-predictor state: one diffusion solver per velocity component
+        # (built once, since dt and geometry are fixed), plus the condensed
+        # index maps and reused RHS / warm-start buffers.
+        self.diffusion_solvers = None      # [u, v, w] MultigridSolvers
+        self.diffusion_index_maps = None   # [u, v, w] condensed face->row maps
+        self.diffusion_rhs = None          # [u, v, w] RHS vectors
+        self.diffusion_x0 = None           # [u, v, w] warm-start vectors
+
         for key, value in params.items():
             if key in self.DEFAULT_PARAMS.keys():
                 self.params[key] = value
@@ -98,6 +138,31 @@ class StokesSolver(Solver):
             raise Exception(
                 f"convergence_criterion must be one of {self.CONVERGENCE_CRITERIA}, "
                 f"got {self.params['convergence_criterion']!r}"
+            )
+
+        if self.params["poisson_backend"] not in self.POISSON_BACKENDS:
+            raise Exception(
+                f"poisson_backend must be one of {self.POISSON_BACKENDS}, "
+                f"got {self.params['poisson_backend']!r}"
+            )
+
+        if self.params["predictor"] not in self.PREDICTORS:
+            raise Exception(
+                f"predictor must be one of {self.PREDICTORS}, "
+                f"got {self.params['predictor']!r}"
+            )
+
+        # The implicit predictor's large-dt (Uzawa) regime is validated only for
+        # the regular z-driven boundary. Irregular INLET/OUTLET geometries are
+        # purely pressure-driven with no outflow face, and the projection stalls
+        # there at large dt -- so guard rather than return a silently wrong
+        # steady field. (Explicit handles irregular boundaries fine.)
+        if (self.params["predictor"] == "implicit"
+                and volume_manager.boundary_volume is not None):
+            raise NotImplementedError(
+                "predictor='implicit' currently supports only regular (z-driven) "
+                "volumes; use predictor='explicit' for irregular boundary_volume "
+                "geometries."
             )
 
     # ------------------------------------------------------------------ #
@@ -229,7 +294,13 @@ class StokesSolver(Solver):
 
         a_sparse, b_bc = poisson_vm.get_sparse_system_jit()
 
-        solver = DarcySolver()
+        # Both backends expose the same set_linear_system / generate_preconditioner
+        # / solve_pcg(X0) interface, so poisson_step is backend-agnostic. The AMG
+        # hierarchy (mgpcg) is built once here since the matrix is geometry-fixed.
+        if self.params["poisson_backend"] == "mgpcg":
+            solver = MultigridSolver(backend="native")
+        else:
+            solver = DarcySolver()
         solver.set_linear_system(a_sparse, b_bc)
         solver.generate_preconditioner(preconditioner="inverse_diagonal")
 
@@ -255,11 +326,16 @@ class StokesSolver(Solver):
     def predictor_step(self, dt):
         """Stage 1: diffusion-only predictor (Stokes has no advection).
 
-            u* = u^n + dt * ( nu * laplacian(u^n) + f )
+        Dispatches on the `predictor` parameter:
+          - "explicit": u* = u^n + dt*(nu*laplacian(u^n) + f)   (forward Euler)
+          - "implicit": (I - dt*nu*laplacian) u* = u^n + dt*f    (backward Euler)
 
-        Writes into the preallocated `*_buf` ping-pong buffers (no allocation)
-        and returns them as (u_star, v_star, w_star).
+        Both write into the preallocated `*_buf` ping-pong buffers (no
+        allocation) and return them as (u_star, v_star, w_star).
         """
+        if self.params["predictor"] == "implicit":
+            return self._implicit_predictor_step(dt)
+
         dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
         nu = self.params["viscosity"]
         fx, fy, fz = (float(f) for f in self.params["body_force"])
@@ -272,6 +348,87 @@ class StokesSolver(Solver):
             self.u_buf, self.v_buf, self.w_buf,
         )
         return self.u_buf, self.v_buf, self.w_buf
+
+    def _build_diffusion_systems(self, dt):
+        """Assemble the implicit diffusion operator M = I - dt*nu*L per velocity
+        component and build its multigrid hierarchy (once; dt and geometry are
+        fixed). Each component's active-face set differs, so there are three
+        independent condensed systems.
+        """
+        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        inv_dx2, inv_dy2, inv_dz2 = 1.0 / dx**2, 1.0 / dy**2, 1.0 / dz**2
+        coef = dt * self.params["viscosity"]
+
+        self.diffusion_solvers = []
+        self.diffusion_index_maps = []
+        self.diffusion_rhs = []
+        self.diffusion_x0 = []
+        for mask in (self.u_mask, self.v_mask, self.w_mask):
+            val, col_idx, row_ptr, index_map, n = _assemble_diffusion_csr(
+                mask, inv_dx2, inv_dy2, inv_dz2, coef
+            )
+            a_sparse = {"val": val, "col_idx": col_idx, "row_ptr": row_ptr}
+            solver = MultigridSolver(backend="native")
+            solver.set_linear_system(a_sparse, np.zeros(n, dtype=np.float64))
+            solver.generate_preconditioner()
+            self.diffusion_solvers.append(solver)
+            self.diffusion_index_maps.append(index_map)
+            self.diffusion_rhs.append(np.zeros(n, dtype=np.float64))
+            self.diffusion_x0.append(np.zeros(n, dtype=np.float64))
+
+        # Scratch for the incremental predictor source u^n - (dt/rho) grad p^n.
+        self._src_u = np.zeros_like(self.u)
+        self._src_v = np.zeros_like(self.v)
+        self._src_w = np.zeros_like(self.w)
+
+    def _implicit_predictor_step(self, dt):
+        """Backward-Euler diffusion predictor solved with multigrid per component.
+
+            (I - dt*nu*L) u* = u^n + dt*f - (dt/rho) grad p^n  (+ open-boundary)
+
+        This is the *incremental* pressure-correction predictor: it carries the
+        previous pressure gradient so the projection error vanishes at steady
+        state (see `_poisson_increment_step`), which is what lets dt be large.
+        The matrices/hierarchies are built once (`_build_diffusion_systems`);
+        each call rebuilds only the RHS and solves warm-started from u^n.
+        """
+        if self.diffusion_solvers is None:
+            self._build_diffusion_systems(dt)
+
+        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        inv_dx2, inv_dy2, inv_dz2 = 1.0 / dx**2, 1.0 / dy**2, 1.0 / dz**2
+        nu = self.params["viscosity"]
+        coef = dt * nu
+        rho = self.params["density"]
+        forces = tuple(float(f) for f in self.params["body_force"])
+        fields = (self.u, self.v, self.w)
+        masks = (self.u_mask, self.v_mask, self.w_mask)
+        buffers = (self.u_buf, self.v_buf, self.w_buf)
+
+        # Source = u^n - (dt/rho) grad p^n on active faces (open-boundary faces,
+        # untouched by the masked gradient, keep their u^n values for coupling).
+        self._src_u[:] = self.u
+        self._src_v[:] = self.v
+        self._src_w[:] = self.w
+        _apply_pressure_gradient_jit(
+            self._src_u, self._src_v, self._src_w, self.p,
+            self.u_mask, self.v_mask, self.w_mask,
+            dt / rho, dx, dy, dz,
+        )
+        sources = (self._src_u, self._src_v, self._src_w)
+
+        for c in range(3):
+            source, field, mask = sources[c], fields[c], masks[c]
+            idx = self.diffusion_index_maps[c]
+            rhs, x0 = self.diffusion_rhs[c], self.diffusion_x0[c]
+            _diffusion_rhs(source, mask, idx, inv_dx2, inv_dy2, inv_dz2,
+                           coef, dt * forces[c], rhs)
+            _gather_face_to_condensed(field, idx, x0)   # warm-start from u^n
+            solver = self.diffusion_solvers[c]
+            solver.b_array = rhs
+            x, _, _ = solver.solve_pcg(X0=x0)
+            _scatter_condensed_to_face(x, idx, buffers[c])
+        return buffers
 
     def poisson_step(self, u_star, v_star, w_star, dt):
         """Stage 2: solve the pressure-Poisson equation for u*.
@@ -309,6 +466,56 @@ class StokesSolver(Solver):
         self.p_condensed = x
         self.p = self.poisson_vm.ravel_sparse_solution(x)
         return self.p
+
+    def _seed_incremental_pressure(self):
+        """Seed p^0 as the harmonic pressure satisfying the inlet/outlet drive.
+
+        Solves `A p^0 = poisson_bc` (i.e. div-free RHS: only the boundary term).
+        The incremental scheme then keeps this drive in `p` and solves only the
+        homogeneous-BC increment `phi` each step, so p carries the pressure drop
+        while phi -> 0 at steady state.
+        """
+        n = self.poisson_vm.nonzeros
+        self.phi_condensed = np.zeros(n, dtype=np.float64)
+        self.phi_full = np.zeros(self.volume_manager.volume.shape, dtype=np.float64)
+        self.poisson_solver.b_array = self.poisson_bc.copy()
+        p0, _, _ = self.poisson_solver.solve_pcg(X0=self.p_condensed)
+        self.p_condensed = p0
+        # ravel (not a bare scatter) so INLET cells carry pressure 1 -- the
+        # predictor's grad(p) at inlet faces needs the driving Dirichlet value.
+        self.p = self.poisson_vm.ravel_sparse_solution(p0).astype(np.float64)
+
+    def _poisson_increment_step(self, u_star, v_star, w_star, dt):
+        """Incremental pressure-correction Poisson solve.
+
+            lap(phi) = (rho/dt) div(u*),   phi = 0 at inlet/outlet (homogeneous)
+
+        Unlike `poisson_step`, the boundary term `poisson_bc` is NOT added, so
+        the solve yields the pressure *increment* phi with homogeneous Dirichlet
+        ghosts. The running pressure is updated `p += phi`. Returns the phi field
+        (cell-centered) for the corrector. Warm-started from the previous phi
+        (which decays to 0 as the field settles).
+        """
+        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        _divergence_jit(u_star, v_star, w_star, self.pressure_mask,
+                        dx, dy, dz, self.div)
+
+        rho = self.params["density"]
+        factor = (self._h ** 2) * rho / dt
+        self.rhs[:] = factor * self.div[self.pressure_mask_bool]
+
+        self.poisson_solver.b_array = self.rhs
+        phi, self.poisson_error, self.poisson_iterations = \
+            self.poisson_solver.solve_pcg(X0=self.phi_condensed)
+
+        self.phi_condensed = phi
+        self.p_condensed = self.p_condensed + phi
+        # p carries the inlet Dirichlet (INLET->1) via ravel; the increment phi
+        # is homogeneous (INLET->0), so it is scattered onto PORE cells directly.
+        self.p = self.poisson_vm.ravel_sparse_solution(self.p_condensed).astype(np.float64)
+        self.phi_full[:] = 0.0
+        self.phi_full[self.pressure_mask_bool] = phi
+        return self.phi_full
 
     def corrector_step(self, u_star, v_star, w_star, pressure, dt):
         """Stage 3: project the intermediate velocity to divergence-free.
@@ -360,6 +567,23 @@ class StokesSolver(Solver):
         max_iterations = self.params["max_iterations"]
         target_error = self.params["target_error"]
 
+        # Incremental pressure-correction (implicit predictor): seed the driving
+        # pressure once, then solve only the homogeneous-BC increment each step.
+        # The implicit pseudo-transient converges to the true steady state for
+        # channel-like geometry but can stall short of it on complex pore media.
+        # So once the implicit phase settles (velocity step below tolerance) we
+        # ALWAYS hand off to the always-correct explicit predictor, which either
+        # confirms the field in ~1 step (implicit was right) or keeps correcting
+        # to the true steady state (implicit had stalled). Same step criterion
+        # throughout; the explicit finish guarantees correctness.
+        started_implicit = self.params["predictor"] == "implicit"
+        incremental = started_implicit
+        self.fell_back = False
+        self.implicit_iterations = 0
+        if started_implicit:
+            self._build_diffusion_systems(dt)
+            self._seed_incremental_pressure()
+
         residual = np.inf
         converged = False
         iteration = 0
@@ -370,8 +594,12 @@ class StokesSolver(Solver):
             # RHS is not polluted by the predictor zeroing the boundary faces.
             self._apply_velocity_boundary_conditions((u_star, v_star, w_star))
 
-            p = self.poisson_step(u_star, v_star, w_star, dt)
-            self.corrector_step(u_star, v_star, w_star, p, dt)
+            if incremental:
+                phi = self._poisson_increment_step(u_star, v_star, w_star, dt)
+                self.corrector_step(u_star, v_star, w_star, phi, dt)
+            else:
+                p = self.poisson_step(u_star, v_star, w_star, dt)
+                self.corrector_step(u_star, v_star, w_star, p, dt)
 
             # Ping-pong swap: the buffers now hold u^{n+1}.
             self.u, self.u_buf = self.u_buf, self.u
@@ -385,8 +613,22 @@ class StokesSolver(Solver):
                 dt,
             )
             if residual < target_error:
+                if incremental:
+                    # Implicit phase settled -> hand off to explicit to verify /
+                    # finish (do not declare convergence yet).
+                    incremental = False
+                    self.implicit_iterations = iteration
+                    self.params["predictor"] = "explicit"
+                    dt = self._compute_timestep()   # -> explicit (stable) dt
+                    continue
                 converged = True
                 break
+
+        # Restore the requested predictor (the handoff mutated it in place) and
+        # flag whether the explicit finish had to do real work (implicit stall).
+        if started_implicit:
+            self.params["predictor"] = "implicit"
+            self.fell_back = (iteration - self.implicit_iterations) > 2
 
         self.iteration = iteration
         self.residual = residual
@@ -400,16 +642,21 @@ class StokesSolver(Solver):
     # Helpers
     # ------------------------------------------------------------------ #
     def _compute_timestep(self):
-        """Constant viscous-limited pseudo-time step.
+        """Constant pseudo-time step.
 
+        Explicit predictor (viscous-stability limited):
             dt = time_step_factor * min(dx_i^2) / (2 * ndim * nu)
+        Implicit predictor (unconditionally stable, so uncapped):
+            dt = implicit_dt_factor * min(dx_i^2) / nu
 
         No advection term, so there is no convective CFL constraint.
         """
         dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
-        ndim = 3
         nu = self.params["viscosity"]
         min_dx2 = min(dx * dx, dy * dy, dz * dz)
+        if self.params["predictor"] == "implicit":
+            return self.params["implicit_dt_factor"] * min_dx2 / nu
+        ndim = 3
         return self.params["time_step_factor"] * min_dx2 / (2.0 * ndim * nu)
 
     def _apply_velocity_boundary_conditions(self, fields=None):
@@ -433,6 +680,53 @@ class StokesSolver(Solver):
             d = self.volume_manager.volume.shape[2]
             w[:, :, 0] = w[:, :, 1] * self.fluid_mask[:, :, 0]
             w[:, :, d] = w[:, :, d - 1] * self.fluid_mask[:, :, d - 1]
+
+    def _momentum_residual(self):
+        """Steady-state momentum residual R = nu*lap(u) - grad(p)/rho + f.
+
+        This is the honest, dt-independent convergence measure: it is what the
+        Stokes equation demands be zero at steady state, so unlike the velocity
+        *step* it cannot be fooled by a pseudo-transient iteration that has
+        stalled short of the solution. Returned as max|R| / max|u| over active
+        faces. Uses the `_src_*` buffers as scratch (free at call time).
+        """
+        nu = self.params["viscosity"]
+        rho = self.params["density"]
+        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        fx, fy, fz = (float(f) for f in self.params["body_force"])
+        ru, rv, rw = self._src_u, self._src_v, self._src_w
+
+        # ru = u + nu*lap(u)  (dt=1, f=0) -> subtract u to get nu*lap(u).
+        _diffuse_jit(self.u, self.v, self.w,
+                     self.u_mask, self.v_mask, self.w_mask,
+                     nu, dx, dy, dz, 0.0, 0.0, 0.0, 1.0, ru, rv, rw)
+        ru -= self.u
+        rv -= self.v
+        rw -= self.w
+        # ru -= grad(p)/rho  on active faces.
+        _apply_pressure_gradient_jit(ru, rv, rw, self.p,
+                                     self.u_mask, self.v_mask, self.w_mask,
+                                     1.0 / rho, dx, dy, dz)
+        # + body force on active faces.
+        if fx != 0.0:
+            ru[self.u_mask == 1] += fx
+        if fy != 0.0:
+            rv[self.v_mask == 1] += fy
+        if fz != 0.0:
+            rw[self.w_mask == 1] += fz
+
+        max_r = 0.0
+        max_u = 0.0
+        for R, field, mask in ((ru, self.u, self.u_mask),
+                               (rv, self.v, self.v_mask),
+                               (rw, self.w, self.w_mask)):
+            active = mask == 1
+            if active.any():
+                max_r = max(max_r, float(np.abs(R[active]).max()))
+                max_u = max(max_u, float(np.abs(field[active]).max()))
+        if max_u == 0.0:
+            return 0.0 if max_r == 0.0 else np.inf
+        return max_r / max_u
 
     def _velocity_residual(self, new_fields, old_fields, dt):
         """Convergence metric over fluid faces, per `convergence_criterion`.
@@ -582,6 +876,155 @@ def _apply_pressure_gradient_jit(
             for k in range(1, D):
                 if w_mask[i, j, k]:
                     w[i, j, k] -= coef * (pressure[i, j, k] - pressure[i, j, k - 1]) / dz
+
+
+@njit
+def _assemble_diffusion_csr(mask, inv_dx2, inv_dy2, inv_dz2, coef):
+    """Condensed CSR for the implicit diffusion operator M = I - coef*L.
+
+    `L` is the same 7-point face Laplacian the explicit predictor uses
+    (diagonal -2*(inv_dx2+inv_dy2+inv_dz2); off-diagonal +inv per neighbour),
+    and `coef = dt*nu`. Only active faces (`mask != 0`) are unknowns; a masked
+    neighbour is Dirichlet (its value is moved to the RHS by `_diffusion_rhs`),
+    so it contributes no column here. The result is a symmetric positive-definite
+    M-matrix in the project CSR convention (row_ptr length N), plus an
+    `index_map` giving the condensed row of each active face (-1 if inactive).
+
+    The stencil diagonal is the full -2*S regardless of whether neighbours are
+    walls / out of bounds, matching `_diffuse_component_jit` exactly, so the
+    implicit and explicit predictors share a fixed point.
+    """
+    nx, ny, nz = mask.shape
+    index_map = -np.ones((nx, ny, nz), dtype=np.int64)
+    n_active = 0
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                if mask[i, j, k] != 0:
+                    index_map[i, j, k] = n_active
+                    n_active += 1
+
+    counts = np.zeros(n_active, dtype=np.int64)
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                r = index_map[i, j, k]
+                if r < 0:
+                    continue
+                c = 1  # diagonal
+                if i > 0 and mask[i - 1, j, k]:
+                    c += 1
+                if i < nx - 1 and mask[i + 1, j, k]:
+                    c += 1
+                if j > 0 and mask[i, j - 1, k]:
+                    c += 1
+                if j < ny - 1 and mask[i, j + 1, k]:
+                    c += 1
+                if k > 0 and mask[i, j, k - 1]:
+                    c += 1
+                if k < nz - 1 and mask[i, j, k + 1]:
+                    c += 1
+                counts[r] = c
+
+    nnz = 0
+    for r in range(n_active):
+        nnz += counts[r]
+    val = np.zeros(nnz, dtype=np.float64)
+    col_idx = np.zeros(nnz, dtype=np.int64)
+    row_ptr = np.zeros(n_active, dtype=np.int64)
+    for r in range(1, n_active):
+        row_ptr[r] = row_ptr[r - 1] + counts[r - 1]
+
+    diag = 1.0 + 2.0 * coef * (inv_dx2 + inv_dy2 + inv_dz2)
+    off_x = -coef * inv_dx2
+    off_y = -coef * inv_dy2
+    off_z = -coef * inv_dz2
+    for i in range(nx):
+        for j in range(ny):
+            for k in range(nz):
+                r = index_map[i, j, k]
+                if r < 0:
+                    continue
+                pos = row_ptr[r]
+                val[pos] = diag
+                col_idx[pos] = r
+                pos += 1
+                if i > 0 and mask[i - 1, j, k]:
+                    val[pos] = off_x; col_idx[pos] = index_map[i - 1, j, k]; pos += 1
+                if i < nx - 1 and mask[i + 1, j, k]:
+                    val[pos] = off_x; col_idx[pos] = index_map[i + 1, j, k]; pos += 1
+                if j > 0 and mask[i, j - 1, k]:
+                    val[pos] = off_y; col_idx[pos] = index_map[i, j - 1, k]; pos += 1
+                if j < ny - 1 and mask[i, j + 1, k]:
+                    val[pos] = off_y; col_idx[pos] = index_map[i, j + 1, k]; pos += 1
+                if k > 0 and mask[i, j, k - 1]:
+                    val[pos] = off_z; col_idx[pos] = index_map[i, j, k - 1]; pos += 1
+                if k < nz - 1 and mask[i, j, k + 1]:
+                    val[pos] = off_z; col_idx[pos] = index_map[i, j, k + 1]; pos += 1
+
+    return val, col_idx, row_ptr, index_map, n_active
+
+
+@njit(parallel=True)
+def _diffusion_rhs(field, mask, index_map, inv_dx2, inv_dy2, inv_dz2,
+                   coef, dt_f, rhs_out):
+    """RHS of the implicit diffusion solve: field + dt*f + boundary coupling.
+
+        rhs[r] = field[face] + dt*f
+                 + coef * sum_{inactive neighbours} inv * field[neighbour]
+
+    Inactive neighbours are walls (field == 0, no contribution) or open
+    inlet/outlet faces (field == opened value -> a lagged Neumann term). This
+    reproduces the explicit stencil's reading of the current boundary field
+    while the interior is solved implicitly.
+    """
+    nx, ny, nz = mask.shape
+    for i in prange(nx):
+        for j in range(ny):
+            for k in range(nz):
+                r = index_map[i, j, k]
+                if r < 0:
+                    continue
+                acc = field[i, j, k] + dt_f
+                if i > 0 and mask[i - 1, j, k] == 0:
+                    acc += coef * inv_dx2 * field[i - 1, j, k]
+                if i < nx - 1 and mask[i + 1, j, k] == 0:
+                    acc += coef * inv_dx2 * field[i + 1, j, k]
+                if j > 0 and mask[i, j - 1, k] == 0:
+                    acc += coef * inv_dy2 * field[i, j - 1, k]
+                if j < ny - 1 and mask[i, j + 1, k] == 0:
+                    acc += coef * inv_dy2 * field[i, j + 1, k]
+                if k > 0 and mask[i, j, k - 1] == 0:
+                    acc += coef * inv_dz2 * field[i, j, k - 1]
+                if k < nz - 1 and mask[i, j, k + 1] == 0:
+                    acc += coef * inv_dz2 * field[i, j, k + 1]
+                rhs_out[r] = acc
+
+
+@njit(parallel=True)
+def _gather_face_to_condensed(field, index_map, out):
+    """out[index_map[face]] = field[face] over active faces (for warm start)."""
+    nx, ny, nz = index_map.shape
+    for i in prange(nx):
+        for j in range(ny):
+            for k in range(nz):
+                r = index_map[i, j, k]
+                if r >= 0:
+                    out[r] = field[i, j, k]
+
+
+@njit(parallel=True)
+def _scatter_condensed_to_face(x, index_map, field_out):
+    """field_out[face] = x[index_map[face]]; inactive faces set to 0."""
+    nx, ny, nz = index_map.shape
+    for i in prange(nx):
+        for j in range(ny):
+            for k in range(nz):
+                r = index_map[i, j, k]
+                if r >= 0:
+                    field_out[i, j, k] = x[r]
+                else:
+                    field_out[i, j, k] = 0.0
 
 
 @njit(parallel=True)

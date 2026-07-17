@@ -595,6 +595,227 @@ def test_invalid_convergence_criterion_raises():
         StokesSolver(VolumeManager(np.ones((3, 3, 3))), convergence_criterion="bogus")
 
 
+def test_invalid_poisson_backend_raises():
+    with pytest.raises(Exception):
+        StokesSolver(VolumeManager(np.ones((3, 3, 3))), poisson_backend="bogus")
+
+
+def test_invalid_predictor_raises():
+    with pytest.raises(Exception):
+        StokesSolver(VolumeManager(np.ones((3, 3, 3))), predictor="bogus")
+
+
+# --------------------------------------------------------------------------- #
+# Implicit (backward-Euler) diffusion predictor  (Phase 2, s10.4 Option A)
+# --------------------------------------------------------------------------- #
+def test_diffusion_matrix_equals_I_minus_coef_laplacian():
+    """The assembled implicit operator M must equal I - coef*L, where L is the
+    same 7-point face Laplacian the explicit predictor applies."""
+    from pyflowsolver.stokesSolver import (
+        _assemble_diffusion_csr, _gather_face_to_condensed, _diffuse_jit)
+    from pyflowsolver.multigridSolver import _csr_matvec
+
+    volume = make_circular_duct(radius=5, length=8)
+    solver = StokesSolver(VolumeManager(volume), viscosity=1.3)
+    solver.create_velocity_arrays()
+
+    coef = 0.37
+    mask = solver.w_mask
+    val, col, rp, idx, n = _assemble_diffusion_csr(mask, 1.0, 1.0, 1.0, coef)
+
+    rng = np.random.default_rng(0)
+    field = np.zeros_like(solver.w)
+    field[mask == 1] = rng.standard_normal(int((mask == 1).sum()))
+    xc = np.zeros(n)
+    _gather_face_to_condensed(field, idx, xc)
+
+    Mx = np.zeros(n)
+    _csr_matvec(val, col, rp, xc, Mx)
+
+    # explicit kernel gives field + coef*L(field); so I - coef*L applied = 2f - out
+    out = np.zeros_like(field)
+    vb = np.zeros_like(solver.v); wb = np.zeros_like(solver.w)
+    _diffuse_jit(field, solver.v, solver.w, mask, solver.v_mask, solver.w_mask,
+                 1.3, 1.0, 1.0, 1.0, 0, 0, 0, coef / 1.3, out, vb, wb)
+    expected = np.zeros(n)
+    _gather_face_to_condensed(2 * field - out, idx, expected)
+
+    np.testing.assert_allclose(Mx, expected, rtol=1e-10, atol=1e-12)
+
+
+def test_implicit_matches_explicit_steady_solution():
+    """Incremental implicit predictor must reach the same steady field as the
+    explicit predictor (different path to the same discrete steady state)."""
+    volume = make_circular_duct(radius=5, length=8)
+    fields = {}
+    for predictor in ("explicit", "implicit"):
+        solver = StokesSolver(VolumeManager(volume.copy()), viscosity=1.0,
+                              density=1.0, max_iterations=40000,
+                              target_error=1e-6, predictor=predictor)
+        fields[predictor] = solver.solve()
+        assert fields[predictor]["converged"]
+
+    for key in ("w", "p"):
+        a, b = fields["explicit"][key], fields["implicit"][key]
+        scale = np.abs(a).max()
+        assert np.abs(a - b).max() <= 5e-3 * scale
+
+
+def test_implicit_far_fewer_iterations():
+    """The implicit predictor's outer count is ~size-independent, so on a duct
+    big enough for the explicit O((L/dx)^2) growth it must use far fewer steps."""
+    volume = make_circular_duct(radius=8, length=12)
+    expl = StokesSolver(VolumeManager(volume.copy()), max_iterations=40000,
+                        target_error=1e-6).solve()
+    impl = StokesSolver(VolumeManager(volume.copy()), max_iterations=40000,
+                        target_error=1e-6, predictor="implicit").solve()
+    assert impl["converged"] and expl["converged"]
+    assert impl["iterations"] < expl["iterations"] // 5
+
+
+def test_implicit_hagen_poiseuille():
+    """The HP parabola regression must hold with the implicit predictor."""
+    radius, length = 6, 8
+    volume = make_circular_duct(radius, length)
+    solver = StokesSolver(VolumeManager(volume), viscosity=1.0, density=1.0,
+                          max_iterations=40000, target_error=1e-6,
+                          predictor="implicit")
+    result = solver.solve()
+    assert result["converged"]
+
+    W, H, D = volume.shape
+    k = D // 2
+    w_center = 0.5 * (result["w"][:, :, k] + result["w"][:, :, k + 1])
+    fluid = volume[:, :, k] > 0
+    c = (W - 1) / 2.0
+    yy, xx = np.mgrid[0:W, 0:H]
+    r2 = ((xx - c) ** 2 + (yy - c) ** 2)[fluid]
+    w = w_center[fluid]
+
+    A = np.vstack([r2, np.ones_like(r2)]).T
+    (slope, intercept), *_ = np.linalg.lstsq(A, w, rcond=None)
+    pred = A @ np.array([slope, intercept])
+    r_squared = 1 - ((w - pred) ** 2).sum() / ((w - w.mean()) ** 2).sum()
+
+    assert r_squared > 0.99
+    analytic_slope = -(1.0 / length) / (4.0 * 1.0)
+    assert np.isclose(slope, analytic_slope, rtol=0.1)
+
+
+def test_implicit_channel_does_not_fall_back():
+    """On a clean channel the implicit pseudo-transient reaches steady state, so
+    the explicit finish is a single confirming step (no real fallback work)."""
+    volume = make_circular_duct(radius=6, length=10)
+    solver = StokesSolver(VolumeManager(volume), max_iterations=40000,
+                          target_error=1e-6, predictor="implicit")
+    result = solver.solve()
+    assert result["converged"]
+    assert solver.implicit_iterations >= 1
+    assert not solver.fell_back                       # implicit did the work
+    assert result["iterations"] - solver.implicit_iterations <= 2
+
+
+def test_implicit_hybrid_correct_on_complex_geometry():
+    """Safety property: on complex geometry where the implicit pseudo-transient
+    stalls, the explicit handoff must still land on the correct steady state
+    (the same field the pure-explicit solver reaches). This is what makes the
+    implicit predictor safe as a default-off accelerator."""
+    import porespy as ps
+    import scipy.ndimage as ndi
+    im = ps.generators.blobs(shape=(16, 16, 16), porosity=0.5,
+                             blobiness=1.0, seed=2)
+    lab, _ = ndi.label(im)
+    im = lab == (np.bincount(lab.ravel())[1:].argmax() + 1)   # percolating cluster
+    volume = im.astype(np.float64)
+
+    expl = StokesSolver(VolumeManager(volume.copy()), max_iterations=40000,
+                        target_error=1e-6, poisson_backend="mgpcg").solve()
+    isolver = StokesSolver(VolumeManager(volume.copy()), max_iterations=40000,
+                           target_error=1e-6, predictor="implicit",
+                           poisson_backend="mgpcg")
+    impl = isolver.solve()
+
+    assert impl["converged"]
+    # Implicit stalls here, so the explicit finish does the real work ...
+    assert isolver.fell_back
+    # ... but the final field must match the pure-explicit solution.
+    scale = np.abs(expl["w"]).max()
+    assert np.abs(expl["w"] - impl["w"]).max() <= 1e-2 * scale
+    # And the momentum residual confirms a genuine steady state (not a stall).
+    assert isolver._momentum_residual() < 1e-4
+
+
+def test_implicit_irregular_boundary_raises():
+    from pyflowsolver.constants import PORE, INLET, OUTLET
+    bv = np.zeros((6, 6, 6), dtype=np.uint8)
+    bv[1:-1, :, 1:-1] = PORE
+    bv[1:-1, 0, 1:-1] = INLET
+    bv[1:-1, -1, 1:-1] = OUTLET
+    vm = VolumeManager((bv >= 1) * 1.0, boundary_volume=bv)
+    with pytest.raises(NotImplementedError):
+        StokesSolver(vm, predictor="implicit")
+
+
+# --------------------------------------------------------------------------- #
+# Multigrid pressure-Poisson backend
+# --------------------------------------------------------------------------- #
+def test_mgpcg_backend_builds_multigrid_solver():
+    from pyflowsolver.multigridSolver import MultigridSolver
+    volume = make_circular_duct(radius=4, length=6)
+    solver = StokesSolver(VolumeManager(volume), poisson_backend="mgpcg")
+    solver.create_velocity_arrays()
+    solver._build_pressure_poisson_system()
+    assert isinstance(solver.poisson_solver, MultigridSolver)
+
+
+def test_mgpcg_matches_pcg_steady_solution():
+    """The multigrid backend must reach the same steady Stokes field as the
+    baseline diagonal-PCG backend (same equations, faster Poisson solve)."""
+    volume = make_circular_duct(radius=5, length=8)
+    fields = {}
+    for backend in ("pcg", "mgpcg"):
+        solver = StokesSolver(VolumeManager(volume.copy()), viscosity=1.0,
+                              density=1.0, max_iterations=20000,
+                              target_error=1e-6, poisson_backend=backend)
+        fields[backend] = solver.solve()
+        assert fields[backend]["converged"]
+
+    # Axial velocity and pressure are the physical unknowns; both must agree.
+    for key in ("w", "p"):
+        a, b = fields["pcg"][key], fields["mgpcg"][key]
+        scale = np.abs(a).max()
+        assert np.abs(a - b).max() <= 1e-5 * scale
+
+
+def test_mgpcg_hagen_poiseuille():
+    """The HP parabola regression must hold with the multigrid backend too."""
+    radius, length = 6, 8
+    volume = make_circular_duct(radius, length)
+    solver = StokesSolver(VolumeManager(volume), viscosity=1.0, density=1.0,
+                          max_iterations=20000, target_error=1e-6,
+                          poisson_backend="mgpcg")
+    result = solver.solve()
+    assert result["converged"]
+
+    W, H, D = volume.shape
+    k = D // 2
+    w_center = 0.5 * (result["w"][:, :, k] + result["w"][:, :, k + 1])
+    fluid = volume[:, :, k] > 0
+    c = (W - 1) / 2.0
+    yy, xx = np.mgrid[0:W, 0:H]
+    r2 = ((xx - c) ** 2 + (yy - c) ** 2)[fluid]
+    w = w_center[fluid]
+
+    A = np.vstack([r2, np.ones_like(r2)]).T
+    (slope, intercept), *_ = np.linalg.lstsq(A, w, rcond=None)
+    pred = A @ np.array([slope, intercept])
+    r_squared = 1 - ((w - pred) ** 2).sum() / ((w - w.mean()) ** 2).sum()
+
+    assert r_squared > 0.99
+    analytic_slope = -(1.0 / length) / (4.0 * 1.0)
+    assert np.isclose(slope, analytic_slope, rtol=0.1)
+
+
 def test_residual_criterion_is_step_over_dt():
     """The 'residual' metric equals the 'step' metric divided by dt."""
     volume = make_circular_duct(radius=3, length=5)

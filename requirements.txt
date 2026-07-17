@@ -2,5 +2,7 @@
 pytest==7.4.4
 numpy==1.23.1
 numba==0.60.0
+scipy==1.13.1
 porespy==2.3.0
 pyedt==0.1.4
+pyamg==5.0.1
