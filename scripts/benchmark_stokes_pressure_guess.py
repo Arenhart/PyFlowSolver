@@ -94,7 +94,8 @@ def arns_estimate(volume, scale):
 def run_stokes(volume, scale, initial_pressure=None, initial_velocity=None):
     vm = VolumeManager(np.array(volume, copy=True), scale=scale)
     solver = StokesSolver(
-        vm,
+        vm.volume,
+        scale=vm.scale,
         initial_pressure=initial_pressure,
         initial_velocity=initial_velocity,
         target_error=TARGET_ERROR,

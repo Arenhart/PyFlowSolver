@@ -84,7 +84,7 @@ def cosine(a, b):
 
 def run_stokes(volume, scale, initial_velocity=None):
     vm = VolumeManager(np.array(volume, copy=True), scale=scale)
-    solver = StokesSolver(vm, initial_velocity=initial_velocity,
+    solver = StokesSolver(vm.volume, scale=vm.scale, initial_velocity=initial_velocity,
                           target_error=TARGET_ERROR, max_iterations=MAX_ITERATIONS)
     t0 = time.perf_counter()
     res = solver.solve()

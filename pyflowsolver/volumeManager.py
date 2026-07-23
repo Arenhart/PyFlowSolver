@@ -61,12 +61,17 @@ class VolumeManager():
             self.neighbours_dict[key] = neighbours
 
 
-    def convert_pore_volume_to_laplacian_conductivity(self, porosity_map=False):
+    def convert_pore_volume_to_laplacian_conductivity(
+            self, 
+            porosity_map=False, 
+            enhanced_model=True,
+        ):
         if not porosity_map:
             self.volume = fast_laplacian_volume_generator(
                 (self.volume >= 1)*100, 
                 self.scale,
-                closed_border=False, 
+                closed_border=False,
+                enhanced_model=enhanced_model,
                 )
         else:
             raise("Not implemented yet")
@@ -480,20 +485,63 @@ class VolumeManager():
         }
 
     def get_conductivity(self, pressure_volume):
-        conductivity = self._get_flow(
-            pressure_volume, 
-            self.boundary_volume, 
-            conductivity_volume=self.volume, 
-            scale=self.scale,
-        )
-        return conductivity
+        if self.boundary_volume is None:
+            flow = self._get_flow_regular(
+                pressure_volume, 
+                conductivity_volume=self.volume, 
+                scale=self.scale,
+            )
+        else:
+            flow = self._get_flow_irregular(
+                pressure_volume, 
+                self.boundary_volume, 
+                conductivity_volume=self.volume, 
+                scale=self.scale,
+            )
+        W, H, D = np.array(pressure_volume.shape) * np.array(self.scale)
+        conductivity = flow * D / (W * H)
+        return flow, conductivity
 
     @staticmethod
     @njit
-    def _get_flow(
+    def _get_flow_regular(
             pressure_volume, 
-            boundary_volume, 
             conductivity_volume, 
+            scale, 
+            pressure_difference=1,
+            ):
+        w, h, d = pressure_volume.shape
+        area_z = scale[0] * scale[1] / scale[2]
+        in_flow = np.float64(0)
+        out_flow = np.float64(0)
+        for x1 in range(w-1):
+            for y1 in range(h-1):
+                for z1 in (0, d-1):
+                    center_pressure = pressure_volume[x1, y1, z1]
+                    if center_pressure == 0:
+                        continue
+                    if z1 == 0:
+                        delta_p = 1 - center_pressure
+                    else:
+                        delta_p = center_pressure
+                    conductivity = 2 * conductivity_volume[x1, y1, z1]
+                    flow = delta_p * conductivity * area_z
+                    if z1 == 0:
+                        in_flow += flow
+                    else:
+                        out_flow += flow
+                    #print (x1, y1, z1, delta_p,  conductivity,  flow)
+        #print(in_flow, out_flow)
+        relative_flow = (in_flow + out_flow) / 2 # flow/pressure_difference
+        flow = relative_flow * pressure_difference
+        return flow
+
+    @staticmethod
+    @njit
+    def _get_flow_irregular(
+            pressure_volume, 
+            boundary_volume,
+            conductivity_volume,
             scale, 
             pressure_difference=1,
             ):
@@ -539,7 +587,6 @@ class VolumeManager():
         relative_flow = (in_flow + out_flow) / 2 # flow/pressure_difference
         flow = relative_flow * pressure_difference
         return flow
-
 
 @njit
 def _jit_sparse_system_extraction(

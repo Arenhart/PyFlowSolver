@@ -238,7 +238,9 @@ class MultigridSolver(Solver):
         n = A.shape[0]
         csr = _to_project_csr(A)
         diag = A.diagonal().astype(np.float64)
-        diag_inv = np.where(diag != 0.0, 1.0 / diag, 0.0)
+        # Empty/isolated rows have a zero diagonal (Jacobi leaves them untouched);
+        # divide only where non-zero to avoid a spurious divide-by-zero warning.
+        diag_inv = np.divide(1.0, diag, out=np.zeros_like(diag), where=diag != 0.0)
         return {
             "n": n,
             "val": csr["val"], "col_idx": csr["col_idx"], "row_ptr": csr["row_ptr"],
@@ -387,8 +389,8 @@ def _smooth_prolongator(A, P_tent):
     few power iterations at setup (once). All scipy, setup-only.
     """
     A = A.tocsr()
-    d = A.diagonal()
-    d_inv = np.where(d != 0.0, 1.0 / d, 0.0)
+    d = A.diagonal().astype(np.float64)
+    d_inv = np.divide(1.0, d, out=np.zeros_like(d), where=d != 0.0)
     Dinv_A = sp.diags(d_inv) @ A
     rho = _estimate_spectral_radius(Dinv_A)
     omega = (4.0 / 3.0) / rho if rho > 0.0 else 0.0

@@ -123,6 +123,47 @@ def test_coarse_correction_reduces_rounds():
     assert rel < 1e-5
 
 
+@pytest.mark.parametrize("resident", [1, 2])
+def test_streaming_matches_single_domain(resident):
+    """Out-of-core streaming Schwarz (rebuild-on-demand, only `resident` slabs
+    held at once) must reach the same solution as the single-domain solve."""
+    vol = make_circular_duct(5, 16)
+    x_ref, _, _ = _single_domain(vol)
+    solver = SchwarzSolver(vol, n_partitions=4, target_error=1e-8, max_rounds=3000)
+    x, rounds, res = solver.solve_streaming(resident=resident)
+    assert x.size == x_ref.size
+    rel = np.linalg.norm(x - x_ref) / (np.linalg.norm(x_ref) or 1)
+    assert rel < 1e-5
+
+
+def test_streaming_matches_serial_on_complex_geometry():
+    """Streaming and all-resident serial converge to the same field on a blob."""
+    import porespy as ps
+    import scipy.ndimage as ndi
+    im = ps.generators.blobs(shape=(20, 20, 20), porosity=0.5,
+                             blobiness=1.0, seed=2)
+    lab, _ = ndi.label(im)
+    im = lab == (np.bincount(lab.ravel())[1:].argmax() + 1)
+    vol = im.astype(np.float64)
+
+    x_serial, _, _ = SchwarzSolver(vol, n_partitions=3, target_error=1e-8,
+                                   max_rounds=3000).solve_serial()
+    x_stream, _, _ = SchwarzSolver(vol, n_partitions=3, target_error=1e-8,
+                                   max_rounds=3000).solve_streaming(resident=1)
+    rel = np.linalg.norm(x_stream - x_serial) / (np.linalg.norm(x_serial) or 1)
+    assert rel < 1e-5
+
+
+def test_streaming_resident_capped_to_partitions():
+    """resident larger than n_partitions is harmless (caches all) and still
+    matches the single-domain solve."""
+    vol = make_circular_duct(4, 8)
+    x_ref, _, _ = _single_domain(vol)
+    solver = SchwarzSolver(vol, n_partitions=2, target_error=1e-8, max_rounds=2000)
+    x, _, _ = solver.solve_streaming(resident=99)
+    np.testing.assert_allclose(x, x_ref, rtol=1e-5, atol=1e-6)
+
+
 def test_warm_start_reduces_rounds():
     """Seeding from the converged field must converge almost immediately -- the
     distributed driver relies on warm starts between rounds."""

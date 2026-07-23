@@ -89,7 +89,7 @@ def arns_speed(pore, enhanced):
 
 def stokes_speed(pore):
     vm = VolumeManager(pore.astype(np.float64), scale=1.0)
-    s = StokesSolver(vm, target_error=STOKES_TOL, max_iterations=STOKES_MAXIT)
+    s = StokesSolver(vm.volume, scale=vm.scale, target_error=STOKES_TOL, max_iterations=STOKES_MAXIT)
     r = s.solve()
     return _cell_speed(r["u"], r["v"], r["w"]), r["iterations"], r["converged"]
 

@@ -19,7 +19,6 @@ from tifffile import imwrite
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO_ROOT)
 
-from pyflowsolver.volumeManager import VolumeManager
 from pyflowsolver.stokesSolver import StokesSolver
 
 RADIUS = 8
@@ -59,12 +58,12 @@ def save_zyx(array, filename):
 
 def main():
     volume = make_circular_duct(RADIUS, LENGTH)
-    vm = VolumeManager(volume, scale=SCALE)
     print(f"Circular duct: shape={volume.shape}, "
           f"fluid voxels={int((volume > 0).sum())}/{volume.size}")
 
     solver = StokesSolver(
-        vm,
+        volume,
+        scale=SCALE,
         viscosity=VISCOSITY,
         density=DENSITY,
         target_error=TARGET_ERROR,

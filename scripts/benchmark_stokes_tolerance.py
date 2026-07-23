@@ -75,7 +75,7 @@ def arns_velocity(volume, scale):
 def run(volume, scale, criterion, tol, initial_velocity=None):
     vm = VolumeManager(np.array(volume, copy=True), scale=scale)
     solver = StokesSolver(
-        vm, initial_velocity=initial_velocity,
+        vm.volume, scale=vm.scale, initial_velocity=initial_velocity,
         convergence_criterion=criterion, target_error=tol,
         max_iterations=MAX_ITERATIONS,
     )
@@ -126,7 +126,7 @@ def main():
     for criterion, tol in (("step", 1e-4), ("residual", 1e-3)):
         for factor in (0.5, 0.25, 0.1):
             vm = VolumeManager(np.array(volume, copy=True), scale=SCALE)
-            solver = StokesSolver(vm, convergence_criterion=criterion,
+            solver = StokesSolver(vm.volume, scale=vm.scale, convergence_criterion=criterion,
                                   target_error=tol, time_step_factor=factor,
                                   max_iterations=MAX_ITERATIONS)
             res = solver.solve()

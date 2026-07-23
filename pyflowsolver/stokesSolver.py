@@ -1,40 +1,32 @@
 """Steady incompressible Stokes (creeping) flow solver.
 
-See `stokes_solver.md` for the full algorithm description. The solver is kept
-deliberately simple: Stokes flow is linear (no advection, no inertia), so we
-obtain the steady field with a pseudo-transient projection iteration and reuse
-`DarcySolver` for the pressure-Poisson solve.
+See `stokes_solver.md` for the full algorithm. Stokes flow is linear (no
+advection, no inertia), so we obtain the steady field with a pseudo-transient
+projection iteration.
 
-The module mirrors the structure of `darcySolver.py`:
-- `DEFAULT_PARAMS` + `**params` validation in `__init__`
-- a public `solve` driver that iterates to steady state
-- module-level `@njit` / `@njit(parallel=True)` kernels for the hot loops
+This solver is self-contained and independent of the Darcy / fast-Laplacian
+model: it takes a voxel volume ndarray, assembles its OWN pressure-Poisson
+operator (`pressurePoisson.py`), and solves each projection's pressure step with
+the algebraic-multigrid `MultigridSolver`. It never imports `VolumeManager`,
+`fastLaplacian`, or `DarcySolver`, and never solves Darcy's law. The only bridge
+between the two models is that a caller may pass a fast-Laplacian result as an
+initial guess (`initial_velocity` / `initial_pressure`) to warm-start Stokes.
 
-The pressure-Poisson linear system reuses VolumeManager's condensed CSR
-assembly (one row per fluid cell) and is solved with `DarcySolver`, which keeps
-memory and CPU proportional to the pore space rather than the full voxel grid --
-important for the low-porosity (10-20%) cylindrical samples this targets. The
-assembly currently assumes isotropic voxels.
+Regular (z-driven) geometry only: z=0 inlet (p=1), z=max outlet (p=0), no-slip
+walls, isotropic voxels. Module-level `@njit` kernels handle the hot loops.
 """
 
 import numpy as np
 from numba import njit, prange
 
 from pyflowsolver.solver import Solver
-from pyflowsolver.volumeManager import VolumeManager
-from pyflowsolver.darcySolver import DarcySolver
 from pyflowsolver.multigridSolver import MultigridSolver
-from pyflowsolver.constants import SOLID, PORE, INLET, OUTLET
+from pyflowsolver.pressurePoisson import assemble_poisson, filter_percolating, ravel
 
 
 class StokesSolver(Solver):
     # Stopping criteria for the projection iteration (see `_velocity_residual`).
     CONVERGENCE_CRITERIA = ("step", "residual")
-    # Backend for the per-iteration pressure-Poisson solve:
-    #   "pcg"   -> DarcySolver diagonal-preconditioned CG (baseline)
-    #   "mgpcg" -> MultigridSolver algebraic-multigrid PCG (size-independent
-    #              iteration count; the big win on large / low-porosity volumes)
-    POISSON_BACKENDS = ("pcg", "mgpcg")
     # Viscous predictor discretization:
     #   "explicit" -> forward-Euler diffusion, dt viscous-limited (baseline)
     #   "implicit" -> backward-Euler diffusion (I - dt*nu*L)u* = u^n + dt*f,
@@ -49,6 +41,13 @@ class StokesSolver(Solver):
     #                 that finish had to do real work. Regular (z-driven) volumes
     #                 only -- irregular boundaries raise NotImplementedError.
     PREDICTORS = ("explicit", "implicit")
+    # Sentinel for `initial_velocity`: derive the seed velocity from
+    # `initial_pressure` via a steady viscous solve (see `_seed_velocity_from_pressure`).
+    SEED_FROM_PRESSURE = "from_pressure"
+    # Relative-residual tolerance for that seed's per-component diffusion solves.
+    # Loose on purpose -- it is only a seed, so an approximate viscous velocity is
+    # plenty and keeps the seed cost low.
+    SEED_TOLERANCE = 1.0e-4
 
     DEFAULT_PARAMS = {
         "viscosity": 1.0,          # kinematic viscosity nu = mu / rho
@@ -63,8 +62,6 @@ class StokesSolver(Solver):
         #                 residual max|R| / max|u|, which is independent of the
         #                 pseudo-time step (a property of the field, not of dt).
         "convergence_criterion": "step",
-        # Pressure-Poisson linear-solve backend (see POISSON_BACKENDS).
-        "poisson_backend": "pcg",
         # Viscous predictor discretization (see PREDICTORS).
         "predictor": "explicit",
         # Pseudo-dt for the implicit predictor: dt = implicit_dt_factor *
@@ -75,22 +72,59 @@ class StokesSolver(Solver):
         # domain diffusion time (~ (L/dx)^2), so the default is deliberately large
         # (overshooting is free -- incremental correction keeps it accurate).
         "implicit_dt_factor": 1.0e6,
+        # Stagnation ("plateau") stop -- a robust safety net for when the field is
+        # steady but the step-residual has flattened at a noise floor ABOVE
+        # target_error (common on complex pore media, where the residual bottoms
+        # out ~1e-7 and a 1e-8 target would otherwise grind to max_iterations).
+        # The solve also stops when the residual improves by less than
+        # `stagnation_tol` (fractional) over the last `stagnation_window`
+        # iterations. Set stagnation_window=0 to disable (pure target_error).
+        "stagnation_window": 25,
+        "stagnation_tol": 1.0e-2,
     }
 
-    def __init__(self, volume_manager, initial_pressure=None,
-                 initial_velocity=None, **params):
+    def __init__(self, volume, scale=1.0, boundary_volume=None,
+                 initial_pressure=None, initial_velocity=None,
+                 backend="native", fast_laplacian_guess=True, **params):
         """
-        volume_manager: a VolumeManager describing the (fixed) voxel geometry.
+        volume: a 3D voxel array `(w, h, d)`; any positive value is pore, 0 is
+            solid. Flow is driven along z (z=0 inlet, z=max outlet).
+        scale: voxel size, a scalar or (dx, dy, dz). Must be isotropic.
+        boundary_volume: reserved for irregular INLET/OUTLET geometries; not yet
+            supported here -- pass None (raises NotImplementedError otherwise).
         initial_pressure: optional first guess for the cell-center pressure,
             an ndarray shaped like the volume `(w, h, d)`. Defaults to zeros.
         initial_velocity: optional first guess for the MAC velocity field, a
-            tuple/list `(u, v, w)` of the staggered face arrays shaped
-            `(w+1, h, d)`, `(w, h+1, d)`, `(w, h, d+1)`. Defaults to zeros.
-            The guess is applied in `create_velocity_arrays`; wall faces are
-            re-zeroed there to keep the no-slip invariant.
+            tuple/list `(u, v, w)` of the staggered face arrays. Defaults to
+            zeros. This is the one place a fast-Laplacian result may be fed in.
+            May also be the string "from_pressure": derive the seed velocity by
+            solving the steady viscous momentum equation for `initial_pressure`
+            (-nu*laplacian(u) = -grad(p)/rho, no-slip). Given a good pressure
+            (e.g. a fast-Laplacian solve), this yields a no-slip-correct velocity
+            that cuts the projection iteration count on complex media (~-30% on
+            Bentheimer). Requires `initial_pressure`.
+        fast_laplacian_guess: if True (default) and no explicit `initial_pressure`
+            / `initial_velocity` is given, `solve` first computes an enhanced
+            fast-Laplacian (Arns) pressure for `volume` and warm-starts from it
+            (velocity derived as with "from_pressure"). Recommended default on
+            complex media (~-30% iterations, no accuracy cost). It couples the
+            solve to `VolumeManager`/`fastLaplacian` (pulls `pyedt`), imported
+            lazily so a plain `import` stays free of that dependency. Set False for
+            a pure cold start (no Darcy/EDT dependency, no warm-start overhead).
         params: any key in DEFAULT_PARAMS (see module docstring / md file).
         """
-        self.volume_manager = volume_manager
+        if boundary_volume is not None:
+            raise NotImplementedError(
+                "StokesSolver supports regular (z-driven) volumes only; irregular "
+                "boundary_volume geometries are not yet supported."
+            )
+        self.volume = np.asarray(volume)
+        scale = np.asarray(scale, dtype=np.float64).ravel()
+        self.scale = np.repeat(scale, 3) if scale.size == 1 else scale
+        self.boundary_volume = None
+        self._fluid_bool = None          # filtered percolating mask (set lazily)
+        self.backend = backend
+        self.fast_laplacian_guess = fast_laplacian_guess
         self.params = self.DEFAULT_PARAMS.copy()
 
         # Optional warm-start guesses, applied by create_velocity_arrays.
@@ -116,7 +150,7 @@ class StokesSolver(Solver):
         self.v_mask = None       # active y-faces
         self.w_mask = None       # active z-faces
 
-        # Cached pressure-Poisson DarcySolver (matrix + preconditioner)
+        # Cached pressure-Poisson solver (MultigridSolver: matrix + hierarchy)
         self.poisson_solver = None
 
         # Implicit-predictor state: one diffusion solver per velocity component
@@ -140,30 +174,27 @@ class StokesSolver(Solver):
                 f"got {self.params['convergence_criterion']!r}"
             )
 
-        if self.params["poisson_backend"] not in self.POISSON_BACKENDS:
-            raise Exception(
-                f"poisson_backend must be one of {self.POISSON_BACKENDS}, "
-                f"got {self.params['poisson_backend']!r}"
-            )
-
         if self.params["predictor"] not in self.PREDICTORS:
             raise Exception(
                 f"predictor must be one of {self.PREDICTORS}, "
                 f"got {self.params['predictor']!r}"
             )
 
-        # The implicit predictor's large-dt (Uzawa) regime is validated only for
-        # the regular z-driven boundary. Irregular INLET/OUTLET geometries are
-        # purely pressure-driven with no outflow face, and the projection stalls
-        # there at large dt -- so guard rather than return a silently wrong
-        # steady field. (Explicit handles irregular boundaries fine.)
-        if (self.params["predictor"] == "implicit"
-                and volume_manager.boundary_volume is not None):
-            raise NotImplementedError(
-                "predictor='implicit' currently supports only regular (z-driven) "
-                "volumes; use predictor='explicit' for irregular boundary_volume "
-                "geometries."
-            )
+        if self.params["stagnation_window"] < 0:
+            raise Exception("stagnation_window must be >= 0 (0 disables the plateau stop)")
+        if self.params["stagnation_tol"] < 0.0:
+            raise Exception("stagnation_tol must be >= 0.0")
+
+        if isinstance(self.initial_velocity, str):
+            if self.initial_velocity != self.SEED_FROM_PRESSURE:
+                raise ValueError(
+                    f"initial_velocity string must be {self.SEED_FROM_PRESSURE!r}, "
+                    f"got {self.initial_velocity!r}"
+                )
+            if self.initial_pressure is None:
+                raise ValueError(
+                    f"initial_velocity={self.SEED_FROM_PRESSURE!r} requires initial_pressure"
+                )
 
     # ------------------------------------------------------------------ #
     # Setup
@@ -171,7 +202,7 @@ class StokesSolver(Solver):
     def create_velocity_arrays(self):
         """Allocate MAC velocity/pressure fields, scratch buffers, and masks.
 
-        Sizes derive from `self.volume_manager.volume.shape == (w, h, d)`:
+        Sizes derive from `self.volume.shape == (w, h, d)`:
             u: (w+1, h, d)   v: (w, h+1, d)   w: (w, h, d+1)   p: (w, h, d)
 
         Everything the iteration touches is allocated here exactly once (fields,
@@ -181,7 +212,7 @@ class StokesSolver(Solver):
         active unknowns (both neighbouring voxels fluid) vs no-slip walls
         (touching a solid voxel).
         """
-        w, h, d = self.volume_manager.volume.shape
+        w, h, d = self.volume.shape
 
         # MAC staggered fields on cell faces (velocity) and centers (pressure).
         self.u = np.zeros((w + 1, h, d), dtype=np.float64)
@@ -211,7 +242,12 @@ class StokesSolver(Solver):
         # Apply optional warm-start guesses on top of the zero fields.
         if self.initial_pressure is not None:
             self._set_initial_field(self.p, self.initial_pressure, "initial_pressure")
-        if self.initial_velocity is not None:
+        if isinstance(self.initial_velocity, str):
+            # Sentinel (validated in __init__): derive the seed velocity from the
+            # just-applied pressure guess via a steady viscous solve. Masks and
+            # buffers above are all it needs.
+            self._seed_velocity_from_pressure()
+        elif self.initial_velocity is not None:
             if len(self.initial_velocity) != 3:
                 raise ValueError(
                     "initial_velocity must be a (u, v, w) tuple of 3 arrays, "
@@ -241,84 +277,132 @@ class StokesSolver(Solver):
             )
         target[...] = source
 
+    def _compute_fast_laplacian_guess(self):
+        """Compute an enhanced fast-Laplacian (Arns) pressure for `self.volume` and
+        install it as the warm start (velocity derived from it in
+        `create_velocity_arrays` via the "from_pressure" path).
+
+        This is the only place StokesSolver touches the Darcy/Arns machinery, so
+        `VolumeManager` (which pulls `fastLaplacian`/`pyedt`) is imported lazily --
+        a plain `import stokesSolver`, or a solve with `fast_laplacian_guess=False`,
+        stays free of that dependency.
+        """
+        from pyflowsolver.volumeManager import VolumeManager  # lazy: pulls pyedt
+        poremap = ((np.asarray(self.volume) > 0).astype(np.float32)) * 100.0
+        vm = VolumeManager(poremap, scale=self.scale)
+        vm.convert_pore_volume_to_laplacian_conductivity(enhanced_model=True)
+        a_sparse, b = vm.get_sparse_system_jit()
+        darcy = MultigridSolver(backend=self.backend)
+        darcy.set_linear_system(a_sparse, b)
+        darcy.generate_preconditioner()
+        x, _, _ = darcy.solve_pcg()
+        self.initial_pressure = np.asarray(vm.ravel_sparse_solution(x), dtype=np.float64)
+        self.initial_velocity = self.SEED_FROM_PRESSURE
+
+    def _seed_velocity_from_pressure(self):
+        """Set u, v, w to the steady viscous velocity implied by `self.p`.
+
+        Solves, per component, the steady Stokes momentum balance for the fixed
+        pressure guess with no-slip walls,
+
+            -nu * laplacian(u) = -grad(p)/rho  (+ body force),   u = 0 at walls,
+
+        which is what a good pressure (e.g. a fast-Laplacian solve) implies for
+        the velocity. Unlike an algebraic k*grad(p) guess it enforces no-slip and
+        the true viscous profile, removing the slow-mode error that limits the
+        pseudo-transient -- so it reduces the projection iteration count on
+        complex media (not just per-iteration cost).
+
+        Implementation: the implicit predictor at large dt from u=0 IS exactly
+        this steady solve ((I - dt*nu*L)u* = -(dt/rho)grad(p) -> -nu*L*u* =
+        -grad(p)/rho as dt->inf), so we reuse that tested machinery. The
+        per-component diffusion solves use a loose tolerance (`SEED_TOLERANCE`);
+        the (memory-heavy) diffusion hierarchies are freed afterwards since the
+        actual solve rebuilds its own (implicit) or does not need them (explicit).
+        Requires masks/buffers allocated and `self.p` set (both done by the
+        caller `create_velocity_arrays`).
+        """
+        dx, dy, dz = (float(s) for s in self.scale[:3])
+        nu = self.params["viscosity"]
+        min_dx2 = min(dx * dx, dy * dy, dz * dz)
+        # Large (Uzawa-limit) dt so the implicit predictor reduces to the steady
+        # viscous solve, independent of the predictor chosen for the real solve.
+        dt = self.params["implicit_dt_factor"] * min_dx2 / nu
+
+        self._build_diffusion_systems(dt)
+        for diff_solver in self.diffusion_solvers:
+            diff_solver.params["target_error"] = self.SEED_TOLERANCE
+        u_star, v_star, w_star = self._implicit_predictor_step(dt)
+        self.u[...] = u_star
+        self.v[...] = v_star
+        self.w[...] = w_star
+        # Wall faces are already 0 (masked kernels); open the inlet/outlet.
+        self._apply_velocity_boundary_conditions()
+
+        # Free the seed's diffusion hierarchies (~3x velocity-field RAM). An
+        # implicit solve rebuilds them with its own dt; an explicit solve is
+        # matrix-free and never uses them.
+        self.diffusion_solvers = None
+        self.diffusion_index_maps = None
+        self.diffusion_rhs = None
+        self.diffusion_x0 = None
+
     def _compute_fluid_mask(self):
         """Cell-center fluid mask as a 1-byte array (1 = fluid, 0 = solid).
 
-        For an irregular boundary, fluid cells are PORE/INLET/OUTLET voxels;
-        otherwise (regular volume) any voxel with positive conductivity.
+        Only the percolating pore cluster (connected to both the z=0 inlet and
+        the z=max outlet) is kept, so isolated/dead-end pores never become
+        singular rows in the pressure-Poisson. The bool mask is cached in
+        `self._fluid_bool` and reused by `_build_pressure_poisson_system`.
         """
-        vm = self.volume_manager
-        if vm.boundary_volume is not None:
-            fluid = np.isin(vm.boundary_volume, (PORE, INLET, OUTLET))
-        else:
-            fluid = vm.volume > 0
-        return fluid.astype(np.uint8)
+        self._fluid_bool = filter_percolating(self.volume > 0)
+        return self._fluid_bool.astype(np.uint8)
 
     def _build_pressure_poisson_system(self):
         """Assemble the (geometry-fixed) pressure-Poisson matrix once.
 
-        Uses `self.volume_manager` to build the Laplacian sparse system in the
-        CSR convention `DarcySolver` consumes, wraps it in a `DarcySolver`, and
-        generates its preconditioner. Only the RHS changes per iteration, so
-        the matrix and preconditioner are cached in `self.poisson_solver`.
-
-        The system is the *condensed* CSR Laplacian VolumeManager produces:
-        only fluid cells become unknowns (rows). At 10-20% porosity in
-        cylindrical samples this is a large RAM/CPU saving over a dense grid.
-        We rebuild it from a unit-conductivity copy of the geometry so the
-        matrix is the pure geometric Laplacian (the pressure Poisson operator),
-        with the same inlet=1 / outlet=0 Dirichlet structure as the Darcy path.
+        Assembles the solver's OWN unit MAC Laplacian directly from the fluid
+        mask via `pressurePoisson.assemble_poisson` -- no VolumeManager, no Darcy
+        code. One row per fluid cell (condensed); z=0 inlet / z=max outlet
+        Dirichlet folded into the RHS. Matrix + AMG hierarchy are built once and
+        cached (`self.poisson_solver`); only the RHS changes per iteration. The
+        assembled operator is the *bare* Laplacian (unit weights = h**2 times the
+        true operator); the h**2 factor is folded into the RHS in `poisson_step`.
         """
-        vm = self.volume_manager
-        dx, dy, dz = (float(s) for s in vm.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         if not (np.isclose(dx, dy) and np.isclose(dy, dz)):
             raise NotImplementedError(
-                "Pressure-Poisson assembly via VolumeManager assumes isotropic "
-                f"voxels; got scale=({dx}, {dy}, {dz})."
+                "Pressure-Poisson assembly assumes isotropic voxels; "
+                f"got scale=({dx}, {dy}, {dz})."
             )
         self._h = dx
 
-        # Unit-conductivity geometry so harmonic-mean face weights are all 1 and
-        # VolumeManager builds the bare Laplacian (a scalar h**2 factor is
-        # folded into the RHS in poisson_step).
-        if vm.boundary_volume is not None:
-            geom = (vm.boundary_volume == PORE).astype(np.float64)
-            poisson_vm = VolumeManager(
-                geom, scale=vm.scale, boundary_volume=vm.boundary_volume.copy()
-            )
-            pmask = poisson_vm.boundary_volume == PORE
-        else:
-            geom = (vm.volume > 0).astype(np.float64)
-            poisson_vm = VolumeManager(geom, scale=vm.scale)
-            pmask = poisson_vm.volume > 0
+        mask = self._fluid_bool
+        if mask is None:
+            mask = filter_percolating(self.volume > 0)
+            self._fluid_bool = mask
+        poisson = assemble_poisson(mask)      # own unit MAC Laplacian, no Darcy
+        a_sparse, b_bc = poisson["a_sparse"], poisson["b"]
 
-        a_sparse, b_bc = poisson_vm.get_sparse_system_jit()
-
-        # Both backends expose the same set_linear_system / generate_preconditioner
-        # / solve_pcg(X0) interface, so poisson_step is backend-agnostic. The AMG
-        # hierarchy (mgpcg) is built once here since the matrix is geometry-fixed.
-        if self.params["poisson_backend"] == "mgpcg":
-            solver = MultigridSolver(backend="native")
-        else:
-            solver = DarcySolver()
+        solver = MultigridSolver(backend=self.backend)
         solver.set_linear_system(a_sparse, b_bc)
-        solver.generate_preconditioner(preconditioner="inverse_diagonal")
+        solver.generate_preconditioner()
 
         self.poisson_solver = solver
-        self.poisson_vm = poisson_vm
         self.poisson_bc = b_bc.copy()          # boundary term re-added each step
-        self.pressure_mask = pmask.astype(np.uint8)
-        self.pressure_mask_bool = pmask.astype(bool)
+        self.pressure_mask = mask.astype(np.uint8)
+        self.pressure_mask_bool = mask
+        self._poisson_n = poisson["n"]
 
         # Preallocate: dense divergence (pressure-shaped) + condensed RHS vector.
-        self.div = np.zeros(vm.volume.shape, dtype=np.float64)
-        self.rhs = np.zeros(poisson_vm.nonzeros, dtype=np.float64)
+        self.div = np.zeros(self.volume.shape, dtype=np.float64)
+        self.rhs = np.zeros(poisson["n"], dtype=np.float64)
 
         # Warm-start pressure (condensed), seeded from any initial guess.
         if self.p is not None:
             self.p_condensed = self.p[self.pressure_mask_bool].astype(np.float64)
         else:
-            self.p_condensed = np.zeros(poisson_vm.nonzeros, dtype=np.float64)
+            self.p_condensed = np.zeros(poisson["n"], dtype=np.float64)
 
     # ------------------------------------------------------------------ #
     # Projection iteration: predictor -> poisson -> corrector
@@ -336,7 +420,7 @@ class StokesSolver(Solver):
         if self.params["predictor"] == "implicit":
             return self._implicit_predictor_step(dt)
 
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         nu = self.params["viscosity"]
         fx, fy, fz = (float(f) for f in self.params["body_force"])
         _diffuse_jit(
@@ -355,7 +439,7 @@ class StokesSolver(Solver):
         fixed). Each component's active-face set differs, so there are three
         independent condensed systems.
         """
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         inv_dx2, inv_dy2, inv_dz2 = 1.0 / dx**2, 1.0 / dy**2, 1.0 / dz**2
         coef = dt * self.params["viscosity"]
 
@@ -368,7 +452,7 @@ class StokesSolver(Solver):
                 mask, inv_dx2, inv_dy2, inv_dz2, coef
             )
             a_sparse = {"val": val, "col_idx": col_idx, "row_ptr": row_ptr}
-            solver = MultigridSolver(backend="native")
+            solver = MultigridSolver(backend=self.backend)
             solver.set_linear_system(a_sparse, np.zeros(n, dtype=np.float64))
             solver.generate_preconditioner()
             self.diffusion_solvers.append(solver)
@@ -395,7 +479,7 @@ class StokesSolver(Solver):
         if self.diffusion_solvers is None:
             self._build_diffusion_systems(dt)
 
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         inv_dx2, inv_dy2, inv_dz2 = 1.0 / dx**2, 1.0 / dy**2, 1.0 / dz**2
         nu = self.params["viscosity"]
         coef = dt * nu
@@ -436,10 +520,10 @@ class StokesSolver(Solver):
             laplacian(p) = (rho / dt) * div(u*)
 
         Builds the RHS from `div(u*)` on fluid cells, then solves with the
-        cached `DarcySolver` (warm-started from the previous `self.p`).
+        cached multigrid solver (warm-started from the previous `self.p`).
         Returns the new pressure field.
 
-        The Poisson operator VolumeManager assembled is the *bare* Laplacian
+        The assembled pressure-Poisson operator is the *bare* Laplacian
         (unit face weights), i.e. h**2 times the true operator. Multiplying the
         source by h**2 rescales the whole equation, so the boundary term
         `poisson_bc` (already in bare-Laplacian units) is added as-is:
@@ -449,7 +533,7 @@ class StokesSolver(Solver):
         if self.poisson_solver is None:
             self._build_pressure_poisson_system()
 
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         _divergence_jit(u_star, v_star, w_star, self.pressure_mask,
                         dx, dy, dz, self.div)
 
@@ -464,7 +548,7 @@ class StokesSolver(Solver):
             self.poisson_solver.solve_pcg(X0=self.p_condensed)
 
         self.p_condensed = x
-        self.p = self.poisson_vm.ravel_sparse_solution(x)
+        self.p = ravel(x, self.pressure_mask_bool)
         return self.p
 
     def _seed_incremental_pressure(self):
@@ -475,15 +559,13 @@ class StokesSolver(Solver):
         homogeneous-BC increment `phi` each step, so p carries the pressure drop
         while phi -> 0 at steady state.
         """
-        n = self.poisson_vm.nonzeros
+        n = self._poisson_n
         self.phi_condensed = np.zeros(n, dtype=np.float64)
-        self.phi_full = np.zeros(self.volume_manager.volume.shape, dtype=np.float64)
+        self.phi_full = np.zeros(self.volume.shape, dtype=np.float64)
         self.poisson_solver.b_array = self.poisson_bc.copy()
         p0, _, _ = self.poisson_solver.solve_pcg(X0=self.p_condensed)
         self.p_condensed = p0
-        # ravel (not a bare scatter) so INLET cells carry pressure 1 -- the
-        # predictor's grad(p) at inlet faces needs the driving Dirichlet value.
-        self.p = self.poisson_vm.ravel_sparse_solution(p0).astype(np.float64)
+        self.p = ravel(p0, self.pressure_mask_bool)
 
     def _poisson_increment_step(self, u_star, v_star, w_star, dt):
         """Incremental pressure-correction Poisson solve.
@@ -496,7 +578,7 @@ class StokesSolver(Solver):
         (cell-centered) for the corrector. Warm-started from the previous phi
         (which decays to 0 as the field settles).
         """
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         _divergence_jit(u_star, v_star, w_star, self.pressure_mask,
                         dx, dy, dz, self.div)
 
@@ -510,9 +592,7 @@ class StokesSolver(Solver):
 
         self.phi_condensed = phi
         self.p_condensed = self.p_condensed + phi
-        # p carries the inlet Dirichlet (INLET->1) via ravel; the increment phi
-        # is homogeneous (INLET->0), so it is scattered onto PORE cells directly.
-        self.p = self.poisson_vm.ravel_sparse_solution(self.p_condensed).astype(np.float64)
+        self.p = ravel(self.p_condensed, self.pressure_mask_bool)
         self.phi_full[:] = 0.0
         self.phi_full[self.pressure_mask_bool] = phi
         return self.phi_full
@@ -528,7 +608,7 @@ class StokesSolver(Solver):
         result is discretely divergence-free on the fluid cells. Wall faces
         (mask 0) are left untouched (they stay at 0, i.e. no-slip).
         """
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         coef = dt / self.params["density"]
         _apply_pressure_gradient_jit(
             u_star, v_star, w_star,
@@ -559,6 +639,11 @@ class StokesSolver(Solver):
         (`iterations`, `residual`, `converged`).
         """
         if self.u is None:
+            # Default warm start: compute a fast-Laplacian pressure and seed from
+            # it, unless the caller supplied their own guess or opted out.
+            if (self.fast_laplacian_guess and self.initial_pressure is None
+                    and self.initial_velocity is None):
+                self._compute_fast_laplacian_guess()
             self.create_velocity_arrays()
         if self.poisson_solver is None:
             self._build_pressure_poisson_system()
@@ -583,6 +668,16 @@ class StokesSolver(Solver):
         if started_implicit:
             self._build_diffusion_systems(dt)
             self._seed_incremental_pressure()
+
+        # Stopping bookkeeping. `stop_reason` records why the loop ended:
+        #   "target"       -> residual dropped below target_error
+        #   "stagnation"   -> residual plateaued (see _residual_stagnated)
+        #   "max_iterations" -> ran out of iterations without either
+        # `stagnated` is True when the final stop was the plateau safety net
+        # rather than the target (the field is steady but never reached target).
+        self.stop_reason = "max_iterations"
+        self.stagnated = False
+        residual_history = []
 
         residual = np.inf
         converged = False
@@ -612,16 +707,26 @@ class StokesSolver(Solver):
                 (self.u_buf, self.v_buf, self.w_buf),
                 dt,
             )
-            if residual < target_error:
+            residual_history.append(residual)
+
+            hit_target = residual < target_error
+            stagnated = self._residual_stagnated(residual_history)
+            if hit_target or stagnated:
                 if incremental:
-                    # Implicit phase settled -> hand off to explicit to verify /
-                    # finish (do not declare convergence yet).
+                    # Implicit phase settled (target reached OR plateaued) -> hand
+                    # off to the always-correct explicit predictor to verify /
+                    # finish (do not declare convergence yet). Reset the residual
+                    # history so the explicit phase gets a fresh plateau baseline:
+                    # switching predictors makes the residual jump.
                     incremental = False
                     self.implicit_iterations = iteration
                     self.params["predictor"] = "explicit"
                     dt = self._compute_timestep()   # -> explicit (stable) dt
+                    residual_history = []
                     continue
                 converged = True
+                self.stagnated = stagnated and not hit_target
+                self.stop_reason = "target" if hit_target else "stagnation"
                 break
 
         # Restore the requested predictor (the handoff mutated it in place) and
@@ -651,13 +756,34 @@ class StokesSolver(Solver):
 
         No advection term, so there is no convective CFL constraint.
         """
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         nu = self.params["viscosity"]
         min_dx2 = min(dx * dx, dy * dy, dz * dz)
         if self.params["predictor"] == "implicit":
             return self.params["implicit_dt_factor"] * min_dx2 / nu
         ndim = 3
         return self.params["time_step_factor"] * min_dx2 / (2.0 * ndim * nu)
+
+    def _residual_stagnated(self, history):
+        """True when the convergence residual has plateaued.
+
+        The pseudo-transient residual decreases by orders of magnitude while the
+        field is still developing, then flattens at a noise floor once the field
+        is effectively steady. This detects that flat tail so the solve stops
+        when converged even if the floor sits above `target_error` (otherwise it
+        would grind to `max_iterations`). We compare the latest residual to the
+        one `stagnation_window` iterations back: if it improved by less than
+        `stagnation_tol` (fractionally) over that window -- including going flat
+        or rising -- the field is no longer meaningfully changing.
+        """
+        window = self.params["stagnation_window"]
+        if window <= 0 or len(history) <= window:
+            return False
+        past = history[-1 - window]
+        recent = history[-1]
+        if not np.isfinite(past) or past <= 0.0:
+            return False
+        return (past - recent) < self.params["stagnation_tol"] * past
 
     def _apply_velocity_boundary_conditions(self, fields=None):
         """Enforce inlet/outlet velocity BCs on u, v, w (in place).
@@ -667,17 +793,15 @@ class StokesSolver(Solver):
         the only active condition is the open (Neumann / fully-developed) inlet
         and outlet: the z-boundary faces copy their adjacent interior face for
         fluid columns, which lets flux enter/leave the duct while keeping the
-        normal velocity gradient zero. Irregular boundaries drive their flow
-        through the explicit INLET/OUTLET faces (already active), so no extra
-        clamp is applied here.
+        normal velocity gradient zero.
         """
         if fields is None:
             u, v, w = self.u, self.v, self.w
         else:
             u, v, w = fields
 
-        if self.volume_manager.boundary_volume is None:
-            d = self.volume_manager.volume.shape[2]
+        if self.boundary_volume is None:
+            d = self.volume.shape[2]
             w[:, :, 0] = w[:, :, 1] * self.fluid_mask[:, :, 0]
             w[:, :, d] = w[:, :, d - 1] * self.fluid_mask[:, :, d - 1]
 
@@ -692,7 +816,7 @@ class StokesSolver(Solver):
         """
         nu = self.params["viscosity"]
         rho = self.params["density"]
-        dx, dy, dz = (float(s) for s in self.volume_manager.scale[:3])
+        dx, dy, dz = (float(s) for s in self.scale[:3])
         fx, fy, fz = (float(f) for f in self.params["body_force"])
         ru, rv, rw = self._src_u, self._src_v, self._src_w
 

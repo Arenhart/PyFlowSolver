@@ -14,135 +14,44 @@ slab solves its local Laplacian using its neighbours' latest boundary pressure
 as a Dirichlet (halo) condition, then exchanges updated halo layers; iterating
 drives the coupling to consistency and the field to the true global solution.
 
-This module contains the numerical core, written so it runs identically in two
-modes:
-  * ``solve_serial`` -- all slabs in one process (halo exchange in memory); used
-    for validation against the single-domain solve and as a fallback.
-  * distributed -- the same per-slab assemble/solve is shipped to Dask/SLURM
-    workers (see docker/), exchanging halo layers between rounds.
+This module contains the numerical core, written so the same per-slab
+assemble/solve runs in three modes (all giving the same solution):
+  * ``solve_serial`` -- all slabs resident in one process (halo exchange in
+    memory). Fast, but holds every slab at once (RAM ~ the whole problem); used
+    as the reference and as the base the distributed mode parallelizes.
+  * ``solve_streaming(resident=k)`` -- out-of-core on ONE machine: keep at most k
+    slabs resident, rebuild the rest on demand each round (no disk). Peak RAM =
+    floor + k*O(N/n_slabs), so k=1 reaches the distributed per-node RAM floor
+    locally, trading speed (rebuilds) for memory.
+  * distributed -- the same per-slab assemble/solve shipped to Dask/SLURM workers
+    (see docker/), exchanging halo layers between rounds. (Remote wiring is a
+    separate task.)
 
 Conventions match VolumeManager's regular (z-driven) bare-Laplacian: unit
 conductivity, z=0 inlet (p=1) / z=max outlet (p=0) as diagonal ghost terms, and
 no-flux (dropped) connections at solid walls. Isotropic voxels.
 """
 
+from collections import OrderedDict
+
 import numpy as np
 
 from pyflowsolver.multigridSolver import MultigridSolver, _csr_matvec
+from pyflowsolver.pressurePoisson import (
+    filter_percolating, global_fluid_index, slab_ranges, assemble_slab)
 
-
-def global_fluid_index(mask):
-    """Map fluid voxels to global condensed row indices (C order over x,y,z).
-
-    Returns (gidx, n_fluid): gidx is an int64 array shaped like `mask` with the
-    row index of each fluid voxel and -1 for solid, matching the row order
-    VolumeManager produces.
-    """
-    flat = np.cumsum(mask.reshape(-1).astype(np.int64)) - 1
-    gidx = np.where(mask.reshape(-1), flat, -1).astype(np.int64)
-    return gidx.reshape(mask.shape), int(flat[-1] + 1) if mask.any() else 0
-
-
-def slab_ranges(depth, n_partitions):
-    """Contiguous z-ranges [(z_lo, z_hi), ...] partitioning [0, depth)."""
-    bounds = [k * depth // n_partitions for k in range(n_partitions + 1)]
-    return [(bounds[k], bounds[k + 1]) for k in range(n_partitions)]
-
-
-def assemble_slab(mask, gidx, z_lo, z_hi):
-    """Assemble the local Laplacian for the fluid cells of a z-slab.
-
-    `mask` is the full geometry (bool/uint8); `gidx` the global fluid index. Only
-    voxels with z in [z_lo, z_hi) are local unknowns. A fluid neighbour outside
-    the slab (at z_lo-1 or z_hi) is a *halo* cell: its coupling is moved to the
-    RHS (Dirichlet), to be filled each round from the neighbour slab's latest
-    pressure. z=0 / z=max carry the inlet/outlet ghost exactly as VolumeManager.
-
-    Returns a dict with the fixed local system and the halo coupling:
-      a_sparse   : local CSR (project convention, row_ptr length local_n)
-      b_base     : fixed RHS part (inlet ghost); halo part added each round
-      owned_grows: global row index of each local row (for scatter back)
-      halo_rows  : local rows that couple to a halo cell
-      halo_gcols : global index of the halo cell for each halo coupling
-      local_n    : number of local unknowns
-    """
-    W, H, D = mask.shape
-    # Local index for owned fluid cells (C order within the slab).
-    owned = []
-    lidx = -np.ones((W, H, z_hi - z_lo), dtype=np.int64)
-    for x in range(W):
-        for y in range(H):
-            for z in range(z_lo, z_hi):
-                if mask[x, y, z]:
-                    lidx[x, y, z - z_lo] = len(owned)
-                    owned.append(gidx[x, y, z])
-    local_n = len(owned)
-    owned_grows = np.array(owned, dtype=np.int64)
-
-    vals, cols, row_ptr = [], [], np.zeros(local_n, dtype=np.int64)
-    b_base = np.zeros(local_n, dtype=np.float64)
-    halo_rows, halo_gcols = [], []
-    halo_below = 0          # couplings to the slab below (z < z_lo)
-    halo_above = 0          # couplings to the slab above (z >= z_hi)
-
-    neigh = ((-1, 0, 0), (1, 0, 0), (0, -1, 0), (0, 1, 0), (0, 0, -1), (0, 0, 1))
-    for x in range(W):
-        for y in range(H):
-            for z in range(z_lo, z_hi):
-                if not mask[x, y, z]:
-                    continue
-                row = lidx[x, y, z - z_lo]
-                row_ptr[row] = len(vals)
-                total_c = 0.0
-                # inlet / outlet ghost (global z boundary), exactly as VolumeManager
-                if z == 0:
-                    total_c += 2.0
-                    b_base[row] -= 2.0
-                elif z == D - 1:
-                    total_c += 2.0
-                diag_pos = len(vals)
-                vals.append(0.0)            # reserve diagonal slot
-                cols.append(row)
-                for dx, dy, dz in neigh:
-                    xx, yy, zz = x + dx, y + dy, z + dz
-                    if not (0 <= xx < W and 0 <= yy < H and 0 <= zz < D):
-                        continue            # domain wall: no-flux, no contribution
-                    if not mask[xx, yy, zz]:
-                        continue            # solid wall: no-flux
-                    total_c += 1.0          # fluid face contributes to the diagonal
-                    if z_lo <= zz < z_hi:
-                        cols.append(lidx[xx, yy, zz - z_lo])   # owned neighbour
-                        vals.append(1.0)
-                    else:
-                        halo_rows.append(row)                  # halo (Dirichlet)
-                        halo_gcols.append(gidx[xx, yy, zz])
-                        if zz < z_lo:
-                            halo_below += 1
-                        else:
-                            halo_above += 1
-                vals[diag_pos] = -total_c
-
-    a_sparse = {
-        "val": np.array(vals, dtype=np.float64),
-        "col_idx": np.array(cols, dtype=np.int64),
-        "row_ptr": row_ptr,
-    }
-    return {
-        "a_sparse": a_sparse, "b_base": b_base, "owned_grows": owned_grows,
-        "halo_rows": np.array(halo_rows, dtype=np.int64),
-        "halo_gcols": np.array(halo_gcols, dtype=np.int64),
-        "local_n": local_n,
-        "diag_block_sum": float(np.sum(a_sparse["val"])),  # A_c[k,k] = P^T A P
-        "halo_below": halo_below, "halo_above": halo_above,
-    }
 
 
 class SchwarzSolver:
     """Additive-Schwarz Poisson solver over geometry z-slabs (RAM-bounded)."""
 
     def __init__(self, volume, n_partitions=2, target_error=1e-6,
-                 max_rounds=500, local_target=1e-9, use_coarse=True):
-        self.mask = (np.asarray(volume) > 0)
+                 max_rounds=500, local_target=1e-9, use_coarse=True,
+                 filter_disconnected=True):
+        mask = (np.asarray(volume) > 0)
+        # Match VolumeManager: drop non-percolating pores, which would otherwise
+        # be singular (zero-diagonal) rows in the slab systems.
+        self.mask = filter_percolating(mask) if filter_disconnected else mask
         self.n_partitions = n_partitions
         self.target_error = target_error
         self.max_rounds = max_rounds
@@ -251,3 +160,121 @@ class SchwarzSolver:
         self.rounds = rnd
         self.residual = residual / self.b_norm
         return p, rnd, self.residual
+
+    def solve_streaming(self, resident=1, initial=None):
+        """Out-of-core additive two-level Schwarz on a single machine.
+
+        Same slab algorithm as `solve_serial`, but holds at most `resident` slabs
+        (matrix + AMG hierarchy) in RAM at once, **rebuilding the others on demand
+        each round** (no disk). Peak RAM is therefore
+
+            floor  +  resident * O(N / n_partitions)
+
+        where the floor is the full-grid arrays (mask, gidx, global p). With
+        resident=1 this reaches the distributed solver's per-node RAM floor on one
+        box, trading speed (n_partitions rebuilds per round) for memory. The knob
+        spans the whole range: resident >= n_partitions caches everything and is
+        equivalent to `solve_serial` (fast, high RAM).
+
+        Converges to the same solution as `solve_serial`; returns
+        (p_global, rounds, relative_residual). The two-level scheme is
+        *multiplicative* (coarse correction uses the post-sweep residual, like
+        `solve_serial`) -- this needs a second rebuild pass per round for that
+        residual, but is robustly convergent (an additive coarse-on-top-of-exact-
+        fine-solve overshoots and diverges).
+        """
+        ranges = slab_ranges(self.mask.shape[2], self.n_partitions)
+        resident = max(1, min(int(resident), self.n_partitions))
+
+        cache = OrderedDict()                       # i -> (slab, mg), LRU
+        scalars = [None] * self.n_partitions        # (diag_block_sum, halo_above)
+        b_sq = [None] * self.n_partitions           # per-slab ||b_base||^2
+
+        def get(i):
+            hit = cache.get(i)
+            if hit is not None:
+                cache.move_to_end(i)
+                return hit
+            z_lo, z_hi = ranges[i]
+            slab = assemble_slab(self.mask, self.gidx, z_lo, z_hi)
+            mg = MultigridSolver(backend="native", target_error=self.local_target)
+            mg.set_linear_system(slab["a_sparse"],
+                                 np.zeros(slab["local_n"], dtype=np.float64))
+            mg.generate_preconditioner()
+            if scalars[i] is None:                  # capture coarse inputs once
+                scalars[i] = (slab["diag_block_sum"], slab["halo_above"])
+                b_sq[i] = float(np.dot(slab["b_base"], slab["b_base"]))
+            cache[i] = (slab, mg)
+            if len(cache) > resident:
+                cache.popitem(last=False)           # evict least-recently-used
+            return slab, mg
+
+        def slab_rhs(slab, p_):                      # b_base + halo Dirichlet(p_)
+            b = slab["b_base"].copy()
+            if slab["halo_rows"].size:
+                np.add.at(b, slab["halo_rows"], -p_[slab["halo_gcols"]])
+            return b
+
+        p = np.zeros(self.N) if initial is None else initial.astype(np.float64).copy()
+        a_coarse = None
+        b_norm = None
+        residual = np.inf
+        rnd = 0
+        for rnd in range(1, self.max_rounds + 1):
+            # --- Pass A: fine sweep (exact local solves, halo from old p) ------
+            p_new = p.copy()
+            for i in range(self.n_partitions):
+                slab, mg = get(i)
+                mg.b_array = slab_rhs(slab, p)
+                x0 = np.ascontiguousarray(p[slab["owned_grows"]])
+                x, _, _ = mg.solve_pcg(X0=x0.copy())
+                p_new[slab["owned_grows"]] = x
+            p = p_new
+            if b_norm is None:                      # all slabs seen after pass A
+                b_norm = np.sqrt(sum(b_sq)) or 1.0
+            if a_coarse is None and all(s is not None for s in scalars):
+                a_coarse = self._coarse_operator(scalars)
+
+            # --- Pass B: post-sweep residual (rebuild) + coarse correction -----
+            r_c = np.zeros(self.n_partitions)       # P^T r (per-slab residual sum)
+            r_norm_sq = 0.0
+            for i in range(self.n_partitions):
+                slab, mg = get(i)
+                a = slab["a_sparse"]
+                x_owned = np.ascontiguousarray(p[slab["owned_grows"]])
+                ap = np.empty(slab["local_n"], dtype=np.float64)
+                _csr_matvec(a["val"], a["col_idx"], a["row_ptr"], x_owned, ap)
+                r_i = slab_rhs(slab, p) - ap
+                r_c[i] = float(np.sum(r_i))
+                r_norm_sq += float(np.dot(r_i, r_i))
+            residual = np.sqrt(r_norm_sq) / b_norm
+
+            # Coarse correction: scatter e_c[i] onto slab i's cells via gidx
+            # (no need to retain owned-row maps for evicted slabs).
+            if self.use_coarse and self.n_partitions > 1 and a_coarse is not None:
+                e_c = np.linalg.solve(a_coarse, r_c)
+                for i in range(self.n_partitions):
+                    z_lo, z_hi = ranges[i]
+                    sl = self.gidx[:, :, z_lo:z_hi]
+                    p[sl[sl >= 0]] += e_c[i]
+
+            if residual < self.target_error:
+                break
+
+        self.x = p
+        self.rounds = rnd
+        self.residual = residual
+        return p, rnd, residual
+
+    def _coarse_operator(self, scalars):
+        """Tridiagonal coarse operator A_c (one DOF/slab) from per-slab scalars:
+        diagonal = slab local matrix-entry sum; off-diagonal = interface coupling
+        count (== the neighbour's halo_below)."""
+        k = self.n_partitions
+        A_c = np.zeros((k, k), dtype=np.float64)
+        for i, (diag_block_sum, halo_above) in enumerate(scalars):
+            A_c[i, i] = diag_block_sum
+            if i + 1 < k:
+                A_c[i, i + 1] = halo_above
+                A_c[i + 1, i] = halo_above
+        return A_c
