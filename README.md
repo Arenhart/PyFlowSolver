@@ -1,10 +1,11 @@
 # PyFlowSolver
 
-CFD laminar flow solver for porous media and pore networks. It provides **two
-independent flow models**:
+CFD laminar flow solver for porous media and pore networks. It provides **three
+flow models**:
 
 - **Fast-Laplacian** — solves `∇·(k∇p) = 0` on the voxel grid with EDT-estimated conductivities, based on Arns Approximation. Cheap and robust; gives velocity and pressure fields.
 - **Stokes** — pore-resolved steady viscous flow via a projection / fractional-step method on a MAC staggered grid. Gives velocity and pressure fields.
+- **Darcy–Stokes–Brinkman** — Stokes plus a spatially-varying drag term for images with **subresolution porosity** (voxels neither fully solid nor open); reduces to Stokes where pores are resolved.
 
 **Note**: A fast-Laplacian solution can be used as a warm start for Stokes to cut the computation time up to 60%, depending on pore complexity and error tolerance. This is the default behaviour of the Stoke solver, but can be disabled by passing fast_laplacian_guess=False
 
@@ -84,6 +85,45 @@ mid_length = volume.shape[2] // 2
 flux = w_center[:, :, mid_length].sum() * (solver.scale[0] * solver.scale[1])  
 print("volumetric flux Q:", flux)
 ```
+
+---
+
+### 1.3 Darcy–Stokes–Brinkman (subresolution porosity)
+
+`BrinkmanSolver` extends the Stokes projection with a spatially-varying drag
+`−(ν/K)·u`, so a single solve spans open pores (`K → ∞`, exactly Stokes),
+**subresolution** voxels (finite `K`), and the Darcy limit. It takes either a
+precomputed permeability field, or a **porosity map** (`[0..1]` or `[0..100]`)
+whose subresolution voxels get a bundle-of-tubes `K` from a per-region tube-radius
+distribution. In production the radii come from mercury injection (throat radii),
+fitted to a (log-)Gaussian and truncated to the resolution — a pore wider than a
+voxel is resolved, not subresolution.
+
+```python
+from pyflowsolver.brinkmanSolver import BrinkmanSolver
+from pyflowsolver.tubeBundle import TruncatedGaussianTubeDistribution
+
+porosity = ...                     # 3D array in [0..1]: 0 solid, 1 open, else subres
+resolution = 5.0                   # voxel size = subresolution radius cutoff
+
+# fit the throat-radius distribution to MICP data (radii, density), capped at resolution
+throat = TruncatedGaussianTubeDistribution.from_density(radii, density, r_max=resolution)
+#   or  TruncatedGaussianTubeDistribution.from_samples(radii, r_max=resolution)
+
+solver = BrinkmanSolver(
+    porosity_map=porosity,
+    scale=resolution,
+    distributions={2: throat},     # one distribution per subresolution region (labels 2, 3, ...)
+    predictor="implicit",          # default; robust for the stiff Darcy limit
+)
+result = solver.solve()
+u, v, w, p = result["u"], result["v"], result["w"], result["p"]
+k_eff = solver.effective_permeability()          # sample-scale Darcy permeability
+```
+
+Region labels are auto-derived from the porosity map (`0` solid, `1` fully open,
+`2+` subresolution) unless a `labelmap` is passed. To drive a precomputed field
+instead: `BrinkmanSolver(volume, permeability=K)`.
 
 
 

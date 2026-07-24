@@ -289,7 +289,9 @@ def test_diffuse_jit_matches_manual_stencil():
     w_out = np.empty_like(w)
 
     nu, dx, dy, dz, dt = 1.2, 0.5, 0.5, 0.5, 0.01
+    dummy = np.zeros((1, 1, 1))  # drag placeholder; has_drag=0 => Stokes path
     _diffuse_jit(u, v, w, u_mask, v_mask, w_mask,
+                 dummy, dummy, dummy, 0,
                  nu, dx, dy, dz, 0.0, 0.0, 0.0, dt,
                  u_out, v_out, w_out)
 
@@ -620,7 +622,9 @@ def test_diffusion_matrix_equals_I_minus_coef_laplacian():
 
     coef = 0.37
     mask = solver.w_mask
-    val, col, rp, idx, n = _assemble_diffusion_csr(mask, 1.0, 1.0, 1.0, coef)
+    dummy = np.zeros((1, 1, 1))  # drag placeholder; has_drag=0 => Stokes operator
+    val, col, rp, idx, n = _assemble_diffusion_csr(
+        mask, 1.0, 1.0, 1.0, coef, dummy, 0, 1.0)
 
     rng = np.random.default_rng(0)
     field = np.zeros_like(solver.w)
@@ -635,6 +639,7 @@ def test_diffusion_matrix_equals_I_minus_coef_laplacian():
     out = np.zeros_like(field)
     vb = np.zeros_like(solver.v); wb = np.zeros_like(solver.w)
     _diffuse_jit(field, solver.v, solver.w, mask, solver.v_mask, solver.w_mask,
+                 dummy, dummy, dummy, 0,
                  1.3, 1.0, 1.0, 1.0, 0, 0, 0, coef / 1.3, out, vb, wb)
     expected = np.zeros(n)
     _gather_face_to_condensed(2 * field - out, idx, expected)

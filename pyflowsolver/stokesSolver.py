@@ -23,6 +23,11 @@ from pyflowsolver.solver import Solver
 from pyflowsolver.multigridSolver import MultigridSolver
 from pyflowsolver.pressurePoisson import assemble_poisson, filter_percolating, ravel
 
+# Placeholder drag array for the pure-Stokes path (permeability is None): passed
+# to the drag-aware kernels with the has_drag flag off, so no full-size zero
+# arrays are allocated for a plain Stokes run (matters at 1000^3+).
+_EMPTY_DRAG = np.zeros((1, 1, 1), dtype=np.float64)
+
 
 class StokesSolver(Solver):
     # Stopping criteria for the projection iteration (see `_velocity_residual`).
@@ -85,7 +90,8 @@ class StokesSolver(Solver):
 
     def __init__(self, volume, scale=1.0, boundary_volume=None,
                  initial_pressure=None, initial_velocity=None,
-                 backend="native", fast_laplacian_guess=True, **params):
+                 backend="native", fast_laplacian_guess=True,
+                 permeability=None, **params):
         """
         volume: a 3D voxel array `(w, h, d)`; any positive value is pore, 0 is
             solid. Flow is driven along z (z=0 inlet, z=max outlet).
@@ -103,6 +109,16 @@ class StokesSolver(Solver):
             (e.g. a fast-Laplacian solve), this yields a no-slip-correct velocity
             that cuts the projection iteration count on complex media (~-30% on
             Bentheimer). Requires `initial_pressure`.
+        permeability: optional per-voxel Darcy permeability field K (length^2),
+            an ndarray shaped like the volume `(w, h, d)`. When given, the
+            momentum predictor gains a Brinkman drag term -(nu/K)*u (in the
+            rho-normalized equation the coefficient is nu/K, reusing `viscosity`;
+            no separate dynamic viscosity is needed). This makes one solver span
+            open pores (K -> inf, drag -> 0, recovering pure Stokes exactly),
+            subresolution regions (finite K, Brinkman), and the Darcy limit
+            (large drag). Default None => no drag, byte-identical to plain Stokes.
+            Consumed by `BrinkmanSolver`; see brinkman.md.
+            STATUS: plumbing stubbed this session; the drag kernels are TODO.
         fast_laplacian_guess: if True (default) and no explicit `initial_pressure`
             / `initial_velocity` is given, `solve` first computes an enhanced
             fast-Laplacian (Arns) pressure for `volume` and warm-starts from it
@@ -125,6 +141,8 @@ class StokesSolver(Solver):
         self._fluid_bool = None          # filtered percolating mask (set lazily)
         self.backend = backend
         self.fast_laplacian_guess = fast_laplacian_guess
+        # Optional Brinkman permeability field (None => pure Stokes, no drag).
+        self.permeability = None if permeability is None else np.asarray(permeability)
         self.params = self.DEFAULT_PARAMS.copy()
 
         # Optional warm-start guesses, applied by create_velocity_arrays.
@@ -149,6 +167,14 @@ class StokesSolver(Solver):
         self.u_mask = None       # active x-faces
         self.v_mask = None       # active y-faces
         self.w_mask = None       # active z-faces
+
+        # Per-face Brinkman drag coefficient fields nu/K (None => no drag).
+        # Built by _build_drag_fields when `permeability` is set; sampled onto
+        # the three MAC face grids exactly like the *_mask arrays above.
+        self.u_drag = None
+        self.v_drag = None
+        self.w_drag = None
+        self._has_drag = 0       # set by _build_drag_fields (1 when permeability given)
 
         # Cached pressure-Poisson solver (MultigridSolver: matrix + hierarchy)
         self.poisson_solver = None
@@ -239,6 +265,9 @@ class StokesSolver(Solver):
         self.v_mask[:, 1:h, :] = np.logical_and(fluid[:, :-1, :], fluid[:, 1:, :])
         self.w_mask[:, :, 1:d] = np.logical_and(fluid[:, :, :-1], fluid[:, :, 1:])
 
+        # Brinkman drag fields nu/K sampled onto the MAC faces (no-op if None).
+        self._build_drag_fields()
+
         # Apply optional warm-start guesses on top of the zero fields.
         if self.initial_pressure is not None:
             self._set_initial_field(self.p, self.initial_pressure, "initial_pressure")
@@ -266,6 +295,52 @@ class StokesSolver(Solver):
             # clamp the duct shut and force a converged seed to re-develop its
             # end flux over many iterations, so restore them from the interior.
             self._apply_velocity_boundary_conditions()
+
+    def _build_drag_fields(self):
+        """Sample the Brinkman drag coefficient nu/K onto the three MAC face grids.
+
+        Pure Stokes (`self.permeability is None`): sets `self._has_drag = 0` and
+        leaves the drag fields as the shared 1x1x1 placeholder, so the drag-aware
+        kernels take their no-drag branch and no full-size zero arrays are
+        allocated -- behavior (and memory) match the base solver.
+
+        Brinkman (`permeability` set): each velocity face sees the drag of the K
+        straddling it. K is cell-centered `(w, h, d)`; the face value is the mean
+        of the two adjacent cells' drag `nu/K` -- the harmonic mean of K, which is
+        the face rule used elsewhere (`nu / harmmean(K1,K2) = mean(nu/K1, nu/K2)`).
+        Open voxels carry K = inf so nu/K = 0 (no drag, Stokes locally); solid
+        voxels (K = 0) get 0 and never touch an active face anyway.
+        """
+        w, h, d = self.volume.shape
+        if self.permeability is None:
+            self.u_drag = self.v_drag = self.w_drag = _EMPTY_DRAG
+            self._has_drag = 0
+            return
+
+        K = np.asarray(self.permeability, dtype=np.float64)
+        if K.shape != self.volume.shape:
+            raise ValueError(
+                f"permeability has shape {K.shape}, expected {self.volume.shape}"
+            )
+        nu = self.params["viscosity"]
+        # Cell-centered drag nu/K; 0 for open (inf) and solid/invalid (<=0) cells.
+        cell_drag = np.zeros_like(K)
+        finite_pore = np.isfinite(K) & (K > 0.0)
+        cell_drag[finite_pore] = nu / K[finite_pore]
+
+        self.u_drag = np.zeros((w + 1, h, d), dtype=np.float64)
+        self.v_drag = np.zeros((w, h + 1, d), dtype=np.float64)
+        self.w_drag = np.zeros((w, h, d + 1), dtype=np.float64)
+        # Face drag = mean of the two adjacent cells' drag (interior faces only).
+        self.u_drag[1:w, :, :] = 0.5 * (cell_drag[:-1, :, :] + cell_drag[1:, :, :])
+        self.v_drag[:, 1:h, :] = 0.5 * (cell_drag[:, :-1, :] + cell_drag[:, 1:, :])
+        self.w_drag[:, :, 1:d] = 0.5 * (cell_drag[:, :, :-1] + cell_drag[:, :, 1:])
+        # Only active faces carry drag; walls/inlet/outlet faces are handled by
+        # the masked kernels and the BC step.
+        self.u_drag *= self.u_mask
+        self.v_drag *= self.v_mask
+        self.w_drag *= self.w_mask
+        self._has_drag = 1
 
     @staticmethod
     def _set_initial_field(target, source, name):
@@ -426,6 +501,7 @@ class StokesSolver(Solver):
         _diffuse_jit(
             self.u, self.v, self.w,
             self.u_mask, self.v_mask, self.w_mask,
+            self.u_drag, self.v_drag, self.w_drag, self._has_drag,
             nu, dx, dy, dz,
             fx, fy, fz,
             dt,
@@ -447,9 +523,10 @@ class StokesSolver(Solver):
         self.diffusion_index_maps = []
         self.diffusion_rhs = []
         self.diffusion_x0 = []
-        for mask in (self.u_mask, self.v_mask, self.w_mask):
+        drags = (self.u_drag, self.v_drag, self.w_drag)
+        for mask, drag in zip((self.u_mask, self.v_mask, self.w_mask), drags):
             val, col_idx, row_ptr, index_map, n = _assemble_diffusion_csr(
-                mask, inv_dx2, inv_dy2, inv_dz2, coef
+                mask, inv_dx2, inv_dy2, inv_dz2, coef, drag, self._has_drag, dt
             )
             a_sparse = {"val": val, "col_idx": col_idx, "row_ptr": row_ptr}
             solver = MultigridSolver(backend=self.backend)
@@ -762,7 +839,18 @@ class StokesSolver(Solver):
         if self.params["predictor"] == "implicit":
             return self.params["implicit_dt_factor"] * min_dx2 / nu
         ndim = 3
-        return self.params["time_step_factor"] * min_dx2 / (2.0 * ndim * nu)
+        dt = self.params["time_step_factor"] * min_dx2 / (2.0 * ndim * nu)
+        # Brinkman: the drag -(nu/K)*u is a reaction term whose forward-Euler
+        # stability limit is dt <= 2/max(nu/K) = 2*min(K)/nu. Cap dt with it.
+        # (Where drag dominates -- small K, Darcy limit -- this cap is tiny;
+        # prefer the implicit predictor there, which is unconditionally stable.)
+        if self._has_drag:
+            max_drag = max(float(self.u_drag.max()),
+                           float(self.v_drag.max()),
+                           float(self.w_drag.max()))
+            if max_drag > 0.0:
+                dt = min(dt, self.params["time_step_factor"] * 2.0 / max_drag)
+        return dt
 
     def _residual_stagnated(self, history):
         """True when the convergence residual has plateaued.
@@ -813,6 +901,11 @@ class StokesSolver(Solver):
         *step* it cannot be fooled by a pseudo-transient iteration that has
         stalled short of the solution. Returned as max|R| / max|u| over active
         faces. Uses the `_src_*` buffers as scratch (free at call time).
+
+        Brinkman: passing the drag fields to `_diffuse_jit` (dt=1, f=0) makes the
+        computed value `u + nu*lap(u) - (nu/K)*u`, so subtracting `u` leaves the
+        full viscous-plus-drag operator and the residual becomes
+        R = nu*lap(u) - (nu/K)*u - grad(p)/rho + f. No drag => pure Stokes.
         """
         nu = self.params["viscosity"]
         rho = self.params["density"]
@@ -820,9 +913,10 @@ class StokesSolver(Solver):
         fx, fy, fz = (float(f) for f in self.params["body_force"])
         ru, rv, rw = self._src_u, self._src_v, self._src_w
 
-        # ru = u + nu*lap(u)  (dt=1, f=0) -> subtract u to get nu*lap(u).
+        # ru = u + nu*lap(u) - drag*u  (dt=1, f=0) -> subtract u for the operator.
         _diffuse_jit(self.u, self.v, self.w,
                      self.u_mask, self.v_mask, self.w_mask,
+                     self.u_drag, self.v_drag, self.w_drag, self._has_drag,
                      nu, dx, dy, dz, 0.0, 0.0, 0.0, 1.0, ru, rv, rw)
         ru -= self.u
         rv -= self.v
@@ -886,13 +980,18 @@ class StokesSolver(Solver):
 # ====================================================================== #
 
 @njit(parallel=True)
-def _diffuse_component_jit(field, mask, nu, f, inv_dx2, inv_dy2, inv_dz2, dt, out):
-    """Single-component diffusion predictor: out = field + dt*(nu*lap + f).
+def _diffuse_component_jit(field, mask, drag, has_drag,
+                           nu, f, inv_dx2, inv_dy2, inv_dz2, dt, out):
+    """Single-component diffusion(-drag) predictor.
+
+        Stokes:   out = field + dt*(nu*lap + f)
+        Brinkman: out = field + dt*(nu*lap + f - drag*field)   (has_drag != 0)
 
     Central-difference 7-point Laplacian over the face field. Neighbours that
     fall outside the array are treated as 0 (no-slip); wall faces already hold
     0, so reading them directly gives the correct no-slip contribution. Faces
-    where `mask == 0` are set to 0 in the output.
+    where `mask == 0` are set to 0 in the output. When `has_drag == 0`, `drag`
+    is an unused placeholder and the update is byte-identical to pure Stokes.
     """
     nx, ny, nz = field.shape
     for i in prange(nx):
@@ -911,30 +1010,37 @@ def _diffuse_component_jit(field, mask, nu, f, inv_dx2, inv_dy2, inv_dz2, dt, ou
                 lap = ((xp - 2.0 * c + xm) * inv_dx2
                        + (yp - 2.0 * c + ym) * inv_dy2
                        + (zp - 2.0 * c + zm) * inv_dz2)
-                out[i, j, k] = c + dt * (nu * lap + f)
+                if has_drag != 0:
+                    out[i, j, k] = c + dt * (nu * lap + f - drag[i, j, k] * c)
+                else:
+                    out[i, j, k] = c + dt * (nu * lap + f)
 
 
 @njit
 def _diffuse_jit(
     u, v, w,
     u_mask, v_mask, w_mask,
+    u_drag, v_drag, w_drag, has_drag,
     nu, dx, dy, dz,
     fx, fy, fz,
     dt,
     u_out, v_out, w_out,
 ):
-    """Compute u* = u + dt * (nu * laplacian(u) + f) per component.
+    """Per-component diffusion(-drag) predictor.
+
+        Stokes:   u* = u + dt*(nu*laplacian(u) + f)
+        Brinkman: u* = u + dt*(nu*laplacian(u) + f - (nu/K)*u)   (has_drag != 0)
 
     Stokes flow has no advection, so the predictor is pure diffusion plus the
-    (optional) body force. Central-difference 7-point Laplacian. Writes into
-    the preallocated `u_out, v_out, w_out`; wall faces (mask 0) are left at 0.
+    (optional) body force and (optional) Brinkman drag. Writes into the
+    preallocated `u_out, v_out, w_out`; wall faces (mask 0) are left at 0.
     """
     inv_dx2 = 1.0 / (dx * dx)
     inv_dy2 = 1.0 / (dy * dy)
     inv_dz2 = 1.0 / (dz * dz)
-    _diffuse_component_jit(u, u_mask, nu, fx, inv_dx2, inv_dy2, inv_dz2, dt, u_out)
-    _diffuse_component_jit(v, v_mask, nu, fy, inv_dx2, inv_dy2, inv_dz2, dt, v_out)
-    _diffuse_component_jit(w, w_mask, nu, fz, inv_dx2, inv_dy2, inv_dz2, dt, w_out)
+    _diffuse_component_jit(u, u_mask, u_drag, has_drag, nu, fx, inv_dx2, inv_dy2, inv_dz2, dt, u_out)
+    _diffuse_component_jit(v, v_mask, v_drag, has_drag, nu, fy, inv_dx2, inv_dy2, inv_dz2, dt, v_out)
+    _diffuse_component_jit(w, w_mask, w_drag, has_drag, nu, fz, inv_dx2, inv_dy2, inv_dz2, dt, w_out)
 
 
 @njit(parallel=True)
@@ -1003,20 +1109,33 @@ def _apply_pressure_gradient_jit(
 
 
 @njit
-def _assemble_diffusion_csr(mask, inv_dx2, inv_dy2, inv_dz2, coef):
-    """Condensed CSR for the implicit diffusion operator M = I - coef*L.
+def _assemble_diffusion_csr(mask, inv_dx2, inv_dy2, inv_dz2, coef, drag, has_drag, dt):
+    """Condensed CSR for the implicit diffusion(-drag) operator.
+
+        Stokes:   M = I - coef*L
+        Brinkman: M = I - coef*L + dt*diag(nu/K)   (has_drag != 0)
 
     `L` is the same 7-point face Laplacian the explicit predictor uses
     (diagonal -2*(inv_dx2+inv_dy2+inv_dz2); off-diagonal +inv per neighbour),
-    and `coef = dt*nu`. Only active faces (`mask != 0`) are unknowns; a masked
-    neighbour is Dirichlet (its value is moved to the RHS by `_diffusion_rhs`),
-    so it contributes no column here. The result is a symmetric positive-definite
-    M-matrix in the project CSR convention (row_ptr length N), plus an
+    and `coef = dt*nu`. The Brinkman drag adds a positive per-row term
+    `dt*drag[face]` to the diagonal only (a reaction term), so M stays symmetric
+    positive-definite -- the multigrid solve and the seed path are unaffected,
+    and `has_drag == 0` reproduces the Stokes matrix exactly. Only active faces
+    (`mask != 0`) are unknowns; a masked neighbour is Dirichlet (its value is
+    moved to the RHS by `_diffusion_rhs`), so it contributes no column here. The
+    result is in the project CSR convention (row_ptr length N), plus an
     `index_map` giving the condensed row of each active face (-1 if inactive).
 
     The stencil diagonal is the full -2*S regardless of whether neighbours are
     walls / out of bounds, matching `_diffuse_component_jit` exactly, so the
     implicit and explicit predictors share a fixed point.
+
+    BRINKMAN TODO: the implicit Brinkman operator is M = I - coef*L + dt*diag(nu/K).
+    Add a per-face `drag` array parameter and make the diagonal per-row:
+        val[pos] = diag_base + dt * drag[i, j, k]
+    (drag = nu/K at that face; 0 for open pores). It stays SPD -- a positive
+    diagonal reaction term only improves conditioning -- so the multigrid solve
+    and the seed path (_seed_velocity_from_pressure reuses this) are unchanged.
     """
     nx, ny, nz = mask.shape
     index_map = -np.ones((nx, ny, nz), dtype=np.int64)
@@ -1059,7 +1178,7 @@ def _assemble_diffusion_csr(mask, inv_dx2, inv_dy2, inv_dz2, coef):
     for r in range(1, n_active):
         row_ptr[r] = row_ptr[r - 1] + counts[r - 1]
 
-    diag = 1.0 + 2.0 * coef * (inv_dx2 + inv_dy2 + inv_dz2)
+    diag_base = 1.0 + 2.0 * coef * (inv_dx2 + inv_dy2 + inv_dz2)
     off_x = -coef * inv_dx2
     off_y = -coef * inv_dy2
     off_z = -coef * inv_dz2
@@ -1070,6 +1189,9 @@ def _assemble_diffusion_csr(mask, inv_dx2, inv_dy2, inv_dz2, coef):
                 if r < 0:
                     continue
                 pos = row_ptr[r]
+                diag = diag_base
+                if has_drag != 0:
+                    diag += dt * drag[i, j, k]   # Brinkman reaction term (SPD)
                 val[pos] = diag
                 col_idx[pos] = r
                 pos += 1

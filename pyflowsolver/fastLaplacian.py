@@ -76,29 +76,46 @@ def fast_laplacian_volume_generator(
 
 @njit(parallel=True)
 def _calculate_footprint(edt_array, output_array, spacing):
-    for i in prange(edt_array.shape[0]):
-        for j in range(edt_array.shape[1]):
-            for k in range(edt_array.shape[2]):
-                r = edt_array[i, j, k]
-                r_x = np.ceil(r / spacing[0])
-                r_y = np.ceil(r / spacing[1])
-                r_z = np.ceil(r / spacing[2])
+    """Local-thickness / footprint field.
+
+        output[v] = max{ edt[u] : ||u - v|| <= edt[u] }   for pore voxels (edt[v] > 0)
+
+    i.e. the largest radius of any inscribed ball (centred at any voxel u) that
+    still covers v. Since a voxel covers itself (u == v, distance 0), the result
+    is always >= edt[v].
+    """
+    nx, ny, nz = edt_array.shape
+    sx, sy, sz = spacing[0], spacing[1], spacing[2]
+    r_max = np.max(edt_array)
+    r_x = int(np.ceil(r_max / sx))
+    r_y = int(np.ceil(r_max / sy))
+    r_z = int(np.ceil(r_max / sz))
+    for i in prange(nx):
+        for j in range(ny):
+            for k in range(nz):
+                if edt_array[i, j, k] <= 0:
+                    output_array[i, j, k] = 0.0
+                    continue
+                best = 0.0
                 for d1 in range(-r_x, r_x + 1):
+                    ii = i + d1
+                    if ii < 0 or ii >= nx:
+                        continue
                     for d2 in range(-r_y, r_y + 1):
+                        jj = j + d2
+                        if jj < 0 or jj >= ny:
+                            continue
                         for d3 in range(-r_z, r_z + 1):
-                            if (
-                                0 <= i + d1 < edt_array.shape[0]
-                                and 0 <= j + d2 < edt_array.shape[1]
-                                and 0 <= k + d3 < edt_array.shape[2]
-                            ):
-                                if (
-                                    (
-                                        np.sqrt(
-                                            (d1 * spacing[0]) ** 2 + (d2 * spacing[1]) ** 2 + (d3 * spacing[2]) ** 2
-                                        )
-                                        <= r
-                                    )
-                                    and output_array[i + d1, j + d2, k + d3] < r
-                                    and edt_array[i + d1, j + d2, k + d3] > 0
-                                ):
-                                    output_array[i + d1, j + d2, k + d3] = r
+                            kk = k + d3
+                            if kk < 0 or kk >= nz:
+                                continue
+                            r = edt_array[ii, jj, kk]
+                            # Only a larger covering radius can improve `best`;
+                            # test that before the (costlier) distance check.
+                            if r > best:
+                                dist = np.sqrt((d1 * sx) ** 2
+                                               + (d2 * sy) ** 2
+                                               + (d3 * sz) ** 2)
+                                if dist <= r:
+                                    best = r
+                output_array[i, j, k] = best
