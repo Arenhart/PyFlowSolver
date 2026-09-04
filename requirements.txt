@@ -1,5 +1,5 @@
 pytest==7.4.4
 numpy==1.26.4
-numba==0.60.0
+numba==0.67.0
 porespy==3.0.3
 pyedt==0.1.5
