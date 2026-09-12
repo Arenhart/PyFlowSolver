@@ -69,11 +69,13 @@ class NetworkManager():
         return pressure
     
 
-    def get_flow_rate(self, pressures):
+    def get_flow_rate(self, pressures, flow=None, delta_p=None):
         throats_n = self.cond.size
 
-        flow = np.zeros(throats_n, dtype=np.float64)
-        delta_p = np.zeros(throats_n, dtype=np.float64)
+        if flow is None:
+            flow = np.zeros(throats_n, dtype=np.float64)
+        if delta_p is None:
+            delta_p = np.zeros(throats_n, dtype=np.float64)
         inlet_flow = np.zeros(throats_n, dtype=np.float64)
         outlet_flow = np.zeros(throats_n, dtype=np.float64)
 
